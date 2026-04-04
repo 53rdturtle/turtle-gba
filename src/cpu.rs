@@ -185,7 +185,7 @@ impl Cpu {
         } else {
             // Register with optional shift
             let rm = (instruction & 0xF) as usize;
-            let rm_val = self.registers[rm];
+            let rm_val = self.read_reg(rm);
 
             let shift_type = (instruction >> 5) & 0x3;
             let shift_by_reg = (instruction >> 4) & 1 == 1;
@@ -193,7 +193,7 @@ impl Cpu {
             let amount = if shift_by_reg {
                 // Shift amount from register (Rs), using bottom byte only
                 let rs = ((instruction >> 8) & 0xF) as usize;
-                self.registers[rs] & 0xFF
+                self.read_reg(rs) & 0xFF
             } else {
                 // Shift amount is a 5-bit immediate
                 (instruction >> 7) & 0x1F
@@ -232,6 +232,27 @@ impl Cpu {
         }
     }
 
+    // --- Pipeline Helpers ---
+    // The ARM7TDMI has a 3-stage pipeline: fetch → decode → execute.
+    // When an instruction executes, the PC has already advanced 2 steps ahead.
+    // So reading PC during execution gives: instruction_address + 8.
+    //
+    // In our emulator, after fetch we advance PC by 4 (to instruction_address + 4).
+    // So whenever an instruction reads R15 as an operand, we need to add 4 more
+    // to simulate the real pipeline behavior.
+
+    /// Read a register value, accounting for the pipeline when reading PC.
+    /// During execution, PC reads as instruction_address + 8.
+    fn read_reg(&self, reg: usize) -> u32 {
+        if reg == R_PC {
+            // PC is currently instruction_addr + 4 (from step's advance).
+            // Real hardware sees instruction_addr + 8, so add 4 more.
+            self.registers[R_PC].wrapping_add(4)
+        } else {
+            self.registers[reg]
+        }
+    }
+
     // --- Fetch-Decode-Execute ---
 
     /// Execute one CPU step: fetch an instruction, decode it, execute it.
@@ -241,7 +262,10 @@ impl Cpu {
         let pc = self.registers[R_PC];
         let instruction = bus.read_word(pc);
 
-        // Advance PC to next instruction (4 bytes ahead for ARM mode)
+        // Advance PC to next instruction (4 bytes ahead for ARM mode).
+        // After this, PC = instruction_address + 4.
+        // The read_reg() helper adds another +4 when R15 is used as operand,
+        // giving the correct instruction_address + 8 behavior.
         self.registers[R_PC] = pc.wrapping_add(4);
 
         // If instruction is 0, treat as halt (no real instruction is all zeros in practice)
@@ -305,7 +329,7 @@ impl Cpu {
         // Get operand2 value using the barrel shifter
         let (op2, shift_carry) = self.decode_operand2(instruction, is_immediate == 1);
 
-        let op1 = self.registers[rn];
+        let op1 = self.read_reg(rn);
 
         // Execute the operation based on opcode
         let result = match opcode {
@@ -406,11 +430,13 @@ impl Cpu {
 
         if link {
             // BL: save the return address in LR (so the called function can return)
-            self.registers[R_LR] = self.registers[R_PC]; // PC already advanced by 4
+            self.registers[R_LR] = self.registers[R_PC]; // PC = instruction_addr + 4
         }
 
-        // Jump: add the signed offset to PC
-        self.registers[R_PC] = (self.registers[R_PC] as i32).wrapping_add(offset) as u32;
+        // Jump: target = PC(+8) + offset
+        // read_reg(R_PC) gives instruction_addr + 8 (pipeline-correct)
+        let pc = self.read_reg(R_PC);
+        self.registers[R_PC] = (pc as i32).wrapping_add(offset) as u32;
     }
 
     // --- Single Data Transfer (LDR / STR) ---
@@ -440,11 +466,11 @@ impl Cpu {
             let rm = (instruction & 0xF) as usize;
             let shift_type = (instruction >> 5) & 0x3;
             let shift_amount = (instruction >> 7) & 0x1F;
-            let (shifted, _) = self.barrel_shift(self.registers[rm], shift_type, shift_amount);
+            let (shifted, _) = self.barrel_shift(self.read_reg(rm), shift_type, shift_amount);
             shifted
         };
 
-        let base = self.registers[rn];
+        let base = self.read_reg(rn);
         let addr = if add_offset {
             base.wrapping_add(offset)
         } else {
@@ -698,24 +724,18 @@ mod tests {
     #[test]
     fn loop_sum_1_to_10() {
         // Full integration test: loop, branch, compare, memory store
-        // Same program as the built-in test ROM
+        // Branch offsets now use correct pipeline model: target = PC+8 + offset*4
         let (cpu, bus) = run_program(&[
-            0xEA00_002F, // B start (skip header)
-            // ... 47 zero words as header padding (0x004 to 0x0BF) ...
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x004-0x043
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x044-0x083
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // 0x084-0x0BB
-            // start (offset 0x0C0, instruction index 48):
-            0xE3A0_0000, // MOV R0, #0
-            0xE3A0_100A, // MOV R1, #10
-            0xE3A0_2000, // MOV R2, #0
-            0xE280_0001, // ADD R0, R0, #1
-            0xE082_2000, // ADD R2, R2, R0
-            0xE150_0001, // CMP R0, R1
-            0x1AFF_FFFC, // BNE loop
-            0xE3A0_3003, // MOV R3, #3
-            0xE1A0_3C03, // MOV R3, R3, LSL #24
-            0xE583_2000, // STR R2, [R3]
+            0xE3A0_0000, // 0x00: MOV R0, #0       ; counter = 0
+            0xE3A0_100A, // 0x04: MOV R1, #10      ; limit = 10
+            0xE3A0_2000, // 0x08: MOV R2, #0       ; sum = 0
+            0xE280_0001, // 0x0C: ADD R0, R0, #1   ; counter++        ← loop
+            0xE082_2000, // 0x10: ADD R2, R2, R0   ; sum += counter
+            0xE150_0001, // 0x14: CMP R0, R1       ; counter == limit?
+            0x1AFF_FFFB, // 0x18: BNE loop         ; offset=-5: (0x0C - 0x18 - 8)/4
+            0xE3A0_3003, // 0x1C: MOV R3, #3
+            0xE1A0_3C03, // 0x20: MOV R3, R3, LSL #24  ; R3 = 0x03000000
+            0xE583_2000, // 0x24: STR R2, [R3]     ; IWRAM[0] = 55
         ]);
         assert_eq!(cpu.registers[0], 10);
         assert_eq!(cpu.registers[2], 55);                  // 1+2+...+10

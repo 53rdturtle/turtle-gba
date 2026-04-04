@@ -34,7 +34,7 @@ fn main() {
     println!("{:<10} {:<12} {:<30} Registers", "PC", "Hex", "Instruction");
     println!("{}", "-".repeat(80));
 
-    let max_steps = 100; // Safety limit
+    let max_steps = 20; // Safety limit
     for step in 0..max_steps {
         let pc = cpu.registers[R_PC];
         let instruction = bus.read_word(pc);
@@ -124,14 +124,12 @@ fn make_test_rom() -> Vec<u8> {
 
     // --- Offset 0x000: Entry branch ---
     // B start: branch to offset 0x0C0
-    // The branch offset is: (target - PC - 8) / 4
-    //   PC at fetch time = 0x08000000, but after fetch PC = 0x08000004,
-    //   and ARM pipeline means PC reads as PC+8 during execution.
-    //   Actually in our emulator, PC advances by 4 before execute.
-    //   target = 0x080000C0, PC when branch calculates = 0x08000004 (our PC after advance)
-    //   offset = (0xC0 - 0x04) / 4 = 0x2F
-    // Encoding: 0xEA00002F
-    write_word(&mut rom, 0x000, 0xEA00_002F); // B +0x2F words → offset 0x0C0
+    // The branch offset is: (target - instruction_addr - 8) / 4
+    //   instruction_addr = 0x000
+    //   target = 0x0C0
+    //   offset = (0x0C0 - 0x000 - 8) / 4 = 0xB8 / 4 = 0x2E
+    // Encoding: 0xEA00002E
+    write_word(&mut rom, 0x000, 0xEA00_002E); // B to offset 0x0C0
 
     // --- Offset 0x0A0: Game title ---
     let title = b"TURTLE TEST\0";
@@ -147,7 +145,7 @@ fn make_test_rom() -> Vec<u8> {
         0xE280_0001, // ADD R0, R0, #1   ; counter++
         0xE082_2000, // ADD R2, R2, R0   ; sum += counter
         0xE150_0001, // CMP R0, R1       ; counter == limit?
-        0x1AFF_FFFC, // BNE loop         ; if not equal, go back 3 instructions
+        0x1AFF_FFFB, // BNE loop         ; offset=-5: (0x0CC - 0x0D8 - 8) / 4
         // After loop: R0=10, R2=55
         0xE3A0_3003, // MOV R3, #3
         0xE1A0_3C03, // MOV R3, R3, LSL #24  ; R3 = 0x03000000
