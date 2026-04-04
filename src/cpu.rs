@@ -694,4 +694,32 @@ mod tests {
         assert!(cpu.flag_n());  // Result is negative (bit 31 set)
         assert!(!cpu.flag_z()); // Result is not zero
     }
+
+    #[test]
+    fn loop_sum_1_to_10() {
+        // Full integration test: loop, branch, compare, memory store
+        // Same program as the built-in test ROM
+        let (cpu, bus) = run_program(&[
+            0xEA00_002F, // B start (skip header)
+            // ... 47 zero words as header padding (0x004 to 0x0BF) ...
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x004-0x043
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x044-0x083
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,    // 0x084-0x0BB
+            // start (offset 0x0C0, instruction index 48):
+            0xE3A0_0000, // MOV R0, #0
+            0xE3A0_100A, // MOV R1, #10
+            0xE3A0_2000, // MOV R2, #0
+            0xE280_0001, // ADD R0, R0, #1
+            0xE082_2000, // ADD R2, R2, R0
+            0xE150_0001, // CMP R0, R1
+            0x1AFF_FFFC, // BNE loop
+            0xE3A0_3003, // MOV R3, #3
+            0xE1A0_3C03, // MOV R3, R3, LSL #24
+            0xE583_2000, // STR R2, [R3]
+        ]);
+        assert_eq!(cpu.registers[0], 10);
+        assert_eq!(cpu.registers[2], 55);                  // 1+2+...+10
+        assert_eq!(cpu.registers[3], 0x0300_0000);         // IWRAM base
+        assert_eq!(bus.read_word(0x0300_0000), 55);        // Stored in memory!
+    }
 }
