@@ -96,6 +96,113 @@ impl Cpu {
         }
     }
 
+    // --- Barrel Shifter ---
+    // ARM's secret weapon: the second operand can be shifted for free.
+    // The shifter returns both the shifted value AND a carry-out bit
+    // (which may update the C flag).
+
+    /// Apply a shift operation to a value.
+    /// Returns (shifted_value, carry_out).
+    /// `shift_type`: 0=LSL, 1=LSR, 2=ASR, 3=ROR
+    /// `amount`: how many bits to shift (0-31 for immediate, 0-255 for register)
+    fn barrel_shift(&self, value: u32, shift_type: u32, amount: u32) -> (u32, bool) {
+        let carry_in = self.flag_c(); // Current carry flag as default
+
+        if amount == 0 {
+            // Shift by 0 is a special case for each type:
+            // LSL #0: no change, carry unchanged
+            // LSR #0: actually means LSR #32 (value becomes 0, carry = bit 31)
+            // ASR #0: actually means ASR #32 (all bits become sign bit)
+            // ROR #0: actually means RRX (rotate right by 1 through carry)
+            // But when encoded as immediate shift of 0, LSL #0 = identity
+            return (value, carry_in);
+        }
+
+        match shift_type {
+            0 => { // LSL — Logical Shift Left
+                if amount >= 32 {
+                    let carry = if amount == 32 { value & 1 != 0 } else { false };
+                    (0, carry)
+                } else {
+                    let carry = (value >> (32 - amount)) & 1 != 0;
+                    (value << amount, carry)
+                }
+            }
+            1 => { // LSR — Logical Shift Right
+                if amount >= 32 {
+                    let carry = if amount == 32 { (value >> 31) & 1 != 0 } else { false };
+                    (0, carry)
+                } else {
+                    let carry = (value >> (amount - 1)) & 1 != 0;
+                    (value >> amount, carry)
+                }
+            }
+            2 => { // ASR — Arithmetic Shift Right (preserves sign)
+                if amount >= 32 {
+                    // All bits become the sign bit
+                    let sign = (value as i32) >> 31;
+                    (sign as u32, (value >> 31) & 1 != 0)
+                } else {
+                    let carry = (value >> (amount - 1)) & 1 != 0;
+                    // Cast to i32 so >> preserves the sign bit (arithmetic shift)
+                    ((value as i32 >> amount) as u32, carry)
+                }
+            }
+            3 => { // ROR — Rotate Right
+                if amount == 0 {
+                    // RRX: rotate right by 1 through carry
+                    let carry = value & 1 != 0;
+                    let result = (value >> 1) | ((carry_in as u32) << 31);
+                    (result, carry)
+                } else {
+                    let amount = amount % 32;
+                    if amount == 0 {
+                        (value, (value >> 31) & 1 != 0)
+                    } else {
+                        let carry = (value >> (amount - 1)) & 1 != 0;
+                        (value.rotate_right(amount), carry)
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Decode operand2 for data processing instructions.
+    /// Returns (value, carry_out).
+    fn decode_operand2(&self, instruction: u32, is_immediate: bool) -> (u32, bool) {
+        if is_immediate {
+            // Immediate: 8-bit value rotated right by (rotate * 2)
+            let imm = instruction & 0xFF;
+            let rotate = (instruction >> 8) & 0xF;
+            if rotate == 0 {
+                (imm, self.flag_c())
+            } else {
+                let result = imm.rotate_right(rotate * 2);
+                let carry = (result >> 31) & 1 != 0;
+                (result, carry)
+            }
+        } else {
+            // Register with optional shift
+            let rm = (instruction & 0xF) as usize;
+            let rm_val = self.registers[rm];
+
+            let shift_type = (instruction >> 5) & 0x3;
+            let shift_by_reg = (instruction >> 4) & 1 == 1;
+
+            let amount = if shift_by_reg {
+                // Shift amount from register (Rs), using bottom byte only
+                let rs = ((instruction >> 8) & 0xF) as usize;
+                self.registers[rs] & 0xFF
+            } else {
+                // Shift amount is a 5-bit immediate
+                (instruction >> 7) & 0x1F
+            };
+
+            self.barrel_shift(rm_val, shift_type, amount)
+        }
+    }
+
     // --- Condition checking ---
     // Every ARM instruction has a 4-bit condition code in bits 31-28.
     // The CPU checks flags BEFORE executing — if the condition fails, the
@@ -195,19 +302,8 @@ impl Cpu {
         let rn = ((instruction >> 16) & 0xF) as usize;
         let rd = ((instruction >> 12) & 0xF) as usize;
 
-        // Get operand2 value
-        let op2 = if is_immediate == 1 {
-            // Immediate: 8-bit value rotated right by (rotate * 2)
-            // This clever encoding lets small constants fit in 12 bits
-            let imm = instruction & 0xFF;
-            let rotate = (instruction >> 8) & 0xF;
-            imm.rotate_right(rotate * 2)
-        } else {
-            // Register: value of Rm, optionally shifted
-            let rm = (instruction & 0xF) as usize;
-            self.registers[rm]
-            // TODO: handle shift types (LSL, LSR, ASR, ROR)
-        };
+        // Get operand2 value using the barrel shifter
+        let (op2, shift_carry) = self.decode_operand2(instruction, is_immediate == 1);
 
         let op1 = self.registers[rn];
 
@@ -251,13 +347,38 @@ impl Cpu {
         if set_flags {
             self.set_flag(CPSR_Z, result == 0);
             self.set_flag(CPSR_N, (result >> 31) & 1 == 1);
-            // Carry and overflow depend on the specific operation — simplified for now
-            if opcode == 0x2 || opcode == 0xA {
-                // SUB/CMP: carry is set when there's NO borrow
-                self.set_flag(CPSR_C, op1 >= op2);
-            } else if opcode == 0x4 || opcode == 0xB {
-                // ADD/CMN: carry is set on unsigned overflow
-                self.set_flag(CPSR_C, (op1 as u64 + op2 as u64) > 0xFFFF_FFFF);
+
+            // Carry flag depends on the operation type:
+            match opcode {
+                // Arithmetic ops: carry from the ALU
+                0x2 | 0x3 | 0x6 | 0x7 | 0xA => {
+                    // SUB/RSB/SBC/RSC/CMP: carry = no borrow
+                    self.set_flag(CPSR_C, op1 >= op2);
+                }
+                0x4 | 0x5 | 0xB => {
+                    // ADD/ADC/CMN: carry = unsigned overflow
+                    self.set_flag(CPSR_C, (op1 as u64 + op2 as u64) > 0xFFFF_FFFF);
+                }
+                // Logical ops: carry from the barrel shifter
+                0x0 | 0x1 | 0x8 | 0x9 | 0xC | 0xD | 0xE | 0xF => {
+                    self.set_flag(CPSR_C, shift_carry);
+                }
+                _ => {}
+            }
+
+            // Overflow flag for arithmetic ops (signed overflow)
+            match opcode {
+                0x2 | 0x3 | 0xA => {
+                    // SUB/RSB/CMP: overflow if signs differ and result sign != expected
+                    let overflow = ((op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0;
+                    self.set_flag(CPSR_V, overflow);
+                }
+                0x4 | 0xB => {
+                    // ADD/CMN: overflow if same-sign inputs produce different-sign result
+                    let overflow = (!(op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0;
+                    self.set_flag(CPSR_V, overflow);
+                }
+                _ => {} // Logical ops don't affect V
             }
         }
     }
@@ -315,9 +436,12 @@ impl Cpu {
         let offset = if is_immediate {
             instruction & 0xFFF // 12-bit immediate offset
         } else {
+            // Register offset with optional shift
             let rm = (instruction & 0xF) as usize;
-            self.registers[rm]
-            // TODO: shifted register offset
+            let shift_type = (instruction >> 5) & 0x3;
+            let shift_amount = (instruction >> 7) & 0x1F;
+            let (shifted, _) = self.barrel_shift(self.registers[rm], shift_type, shift_amount);
+            shifted
         };
 
         let base = self.registers[rn];
@@ -484,5 +608,90 @@ mod tests {
         ]);
         assert_eq!(cpu.registers[0], 0);    // Cleared
         assert_eq!(cpu.registers[1], 0xFF); // Loaded from memory
+    }
+
+    // --- Barrel shifter tests ---
+
+    #[test]
+    fn add_with_lsl() {
+        // MOV R0, #3            -> R0 = 3
+        // MOV R1, #5            -> R1 = 5
+        // ADD R2, R0, R1, LSL #2  -> R2 = R0 + (R1 << 2) = 3 + 20 = 23
+        //
+        // ADD R2, R0, R1, LSL #2 encoding:
+        //   cond=AL, 00, I=0, ADD=0100, S=0, Rn=R0, Rd=R2, shift_imm=2, LSL=00, 0, Rm=R1
+        //   0xE0802101
+        let (cpu, _) = run_program(&[
+            0xE3A0_0003, // MOV R0, #3
+            0xE3A0_1005, // MOV R1, #5
+            0xE080_2101, // ADD R2, R0, R1, LSL #2
+        ]);
+        assert_eq!(cpu.registers[2], 23); // 3 + (5 << 2) = 3 + 20
+    }
+
+    #[test]
+    fn mov_with_lsr() {
+        // MOV R0, #128          -> R0 = 128
+        // MOV R1, R0, LSR #3    -> R1 = 128 >> 3 = 16
+        //
+        // MOV R1, R0, LSR #3:
+        //   cond=AL, 00, I=0, MOV=1101, S=0, Rn=0, Rd=R1, shift_imm=3, LSR=01, 0, Rm=R0
+        //   0xE1A011A0
+        let (cpu, _) = run_program(&[
+            0xE3A0_0080, // MOV R0, #128
+            0xE1A0_11A0, // MOV R1, R0, LSR #3
+        ]);
+        assert_eq!(cpu.registers[1], 16); // 128 >> 3
+    }
+
+    #[test]
+    fn asr_preserves_sign() {
+        // We need a negative number (bit 31 set).
+        // MVN R0, #0 -> R0 = 0xFFFFFFFF (-1)
+        // MOV R0, R0, LSL #24 -> R0 = 0xFF000000 (a large negative in signed)
+        // MOV R1, R0, ASR #24 -> R1 = 0xFFFFFFFF (-1, sign preserved)
+        //
+        // MVN R0, #0:   0xE3E00000
+        // LSL R0 by 24: 0xE1A00C00  (MOV R0, R0, LSL #24)
+        // ASR by 24:    0xE1A01C40  (MOV R1, R0, ASR #24)
+        let (cpu, _) = run_program(&[
+            0xE3E0_0000, // MVN R0, #0      -> R0 = 0xFFFFFFFF
+            0xE1A0_0C00, // MOV R0, R0, LSL #24 -> R0 = 0xFF000000
+            0xE1A0_1C40, // MOV R1, R0, ASR #24 -> R1 = 0xFFFFFFFF
+        ]);
+        assert_eq!(cpu.registers[0], 0xFF00_0000);
+        assert_eq!(cpu.registers[1], 0xFFFF_FFFF); // Sign bit filled in
+    }
+
+    #[test]
+    fn multiply_by_shift() {
+        // A common ARM trick: multiply by 5 using shifts and add.
+        // R0 * 5 = R0 * 4 + R0 = (R0 << 2) + R0
+        //
+        // MOV R0, #7
+        // ADD R1, R0, R0, LSL #2  -> R1 = 7 + (7 << 2) = 7 + 28 = 35
+        let (cpu, _) = run_program(&[
+            0xE3A0_0007, // MOV R0, #7
+            0xE080_1100, // ADD R1, R0, R0, LSL #2
+        ]);
+        assert_eq!(cpu.registers[1], 35); // 7 * 5
+    }
+
+    #[test]
+    fn overflow_flag_on_signed_add() {
+        // 0x7FFFFFFF + 1 should overflow (max positive + 1 = negative in signed)
+        // MOV R0, #0x7FFFFFFF is too big for immediate, so build it:
+        // MVN R0, #0      -> 0xFFFFFFFF
+        // MOV R0, R0, LSR #1 -> 0x7FFFFFFF
+        // ADDS R1, R0, #1  -> overflow!
+        let (cpu, _) = run_program(&[
+            0xE3E0_0000, // MVN R0, #0          -> 0xFFFFFFFF
+            0xE1A0_00A0, // MOV R0, R0, LSR #1  -> 0x7FFFFFFF
+            0xE290_1001, // ADDS R1, R0, #1     -> 0x80000000 (overflow!)
+        ]);
+        assert_eq!(cpu.registers[1], 0x8000_0000);
+        assert!(cpu.flag_v());  // Signed overflow occurred
+        assert!(cpu.flag_n());  // Result is negative (bit 31 set)
+        assert!(!cpu.flag_z()); // Result is not zero
     }
 }
