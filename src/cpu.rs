@@ -42,6 +42,7 @@ pub const CPSR_N: u32 = 1 << 31; // Negative
 pub const CPSR_Z: u32 = 1 << 30; // Zero
 pub const CPSR_C: u32 = 1 << 29; // Carry
 pub const CPSR_V: u32 = 1 << 28; // Overflow
+pub const CPSR_T: u32 = 1 << 5;  // Thumb state (0=ARM, 1=THUMB)
 
 impl Cpu {
     /// Create a new CPU in its startup state.
@@ -94,6 +95,11 @@ impl Cpu {
         } else {
             self.cpsr &= !mask; // Turn the bit OFF
         }
+    }
+
+    /// Are we in THUMB mode? (T bit in CPSR)
+    pub fn in_thumb_mode(&self) -> bool {
+        (self.cpsr & CPSR_T) != 0
     }
 
     // --- Barrel Shifter ---
@@ -242,12 +248,17 @@ impl Cpu {
     // to simulate the real pipeline behavior.
 
     /// Read a register value, accounting for the pipeline when reading PC.
-    /// During execution, PC reads as instruction_address + 8.
+    /// During execution, PC reads as instruction_address + 8 (ARM) or +4 (THUMB).
     fn read_reg(&self, reg: usize) -> u32 {
         if reg == R_PC {
-            // PC is currently instruction_addr + 4 (from step's advance).
-            // Real hardware sees instruction_addr + 8, so add 4 more.
-            self.registers[R_PC].wrapping_add(4)
+            // PC is currently instruction_addr + step_size (from step's advance).
+            // ARM: real hardware sees instruction_addr + 8, we have +4, add 4 more.
+            // THUMB: real hardware sees instruction_addr + 4, we have +2, add 2 more.
+            if self.in_thumb_mode() {
+                self.registers[R_PC].wrapping_add(2)
+            } else {
+                self.registers[R_PC].wrapping_add(4)
+            }
         } else {
             self.registers[reg]
         }
@@ -258,14 +269,15 @@ impl Cpu {
     /// Execute one CPU step: fetch an instruction, decode it, execute it.
     /// Returns true if execution should continue, false to halt.
     pub fn step(&mut self, bus: &mut crate::bus::Bus) -> bool {
+        if self.in_thumb_mode() {
+            return self.step_thumb(bus);
+        }
+
         // FETCH: read 32-bit instruction at the PC
         let pc = self.registers[R_PC];
         let instruction = bus.read_word(pc);
 
         // Advance PC to next instruction (4 bytes ahead for ARM mode).
-        // After this, PC = instruction_address + 4.
-        // The read_reg() helper adds another +4 when R15 is used as operand,
-        // giving the correct instruction_address + 8 behavior.
         self.registers[R_PC] = pc.wrapping_add(4);
 
         // If instruction is 0, treat as halt (no real instruction is all zeros in practice)
@@ -280,12 +292,15 @@ impl Cpu {
         }
 
         // DECODE: determine instruction type from bit patterns
-        // ARM encoding uses several bits to identify the instruction category
         let bits_27_26 = (instruction >> 26) & 0b11;
         let bit_25 = (instruction >> 25) & 1;
 
         match bits_27_26 {
             0b00 => {
+                // Check for special instructions encoded in the data processing space
+                if self.try_special_arm(instruction, bus) {
+                    return true;
+                }
                 // Data processing (ALU operations): MOV, ADD, SUB, CMP, AND, ORR, etc.
                 self.execute_data_processing(instruction, bit_25);
             }
@@ -307,6 +322,683 @@ impl Cpu {
         }
 
         true
+    }
+
+    // --- Special ARM instructions ---
+    // Some instructions are encoded in the data processing space (bits 27-26 = 00)
+    // but are NOT data processing. We detect them by specific bit patterns.
+
+    /// Try to handle BX, MSR, MRS, or MUL. Returns true if handled.
+    fn try_special_arm(&mut self, instruction: u32, _bus: &mut crate::bus::Bus) -> bool {
+        // BX — Branch and Exchange (switch ARM <-> THUMB)
+        // Pattern: xxxx 0001 0010 1111 1111 1111 0001 xxxx
+        // Bits 27-4: 0001_0010_1111_1111_1111_0001
+        if instruction & 0x0FFF_FFF0 == 0x012F_FF10 {
+            let rm = (instruction & 0xF) as usize;
+            let addr = self.read_reg(rm);
+            // Bit 0 of the target address determines the new mode:
+            //   1 = switch to THUMB, 0 = stay in ARM
+            if addr & 1 != 0 {
+                self.cpsr |= CPSR_T;  // Enter THUMB mode
+                self.registers[R_PC] = addr & !1; // Clear bit 0 for alignment
+            } else {
+                self.cpsr &= !CPSR_T; // Enter ARM mode
+                self.registers[R_PC] = addr & !3; // Word-align
+            }
+            return true;
+        }
+
+        // MSR — Move to Status Register (write to CPSR/SPSR)
+        // Pattern: xxxx 00x1 0x10 xxxx 1111 xxxx xxxx xxxx
+        if instruction & 0x0DB0_F000 == 0x0120_F000 {
+            let use_immediate = (instruction >> 25) & 1 == 1;
+            let value = if use_immediate {
+                let imm = instruction & 0xFF;
+                let rotate = (instruction >> 8) & 0xF;
+                imm.rotate_right(rotate * 2)
+            } else {
+                let rm = (instruction & 0xF) as usize;
+                self.read_reg(rm)
+            };
+
+            // Which fields to write (bits 19-16 = field mask)
+            let field_mask = (instruction >> 16) & 0xF;
+            let mut mask = 0u32;
+            if field_mask & 0x8 != 0 { mask |= 0xFF00_0000; } // Flags field (N,Z,C,V)
+            if field_mask & 0x1 != 0 { mask |= 0x0000_00FF; } // Control field (mode, T, etc.)
+
+            self.cpsr = (self.cpsr & !mask) | (value & mask);
+            return true;
+        }
+
+        // MRS — Move from Status Register (read CPSR/SPSR)
+        // Pattern: xxxx 0001 0x00 1111 xxxx 0000 0000 0000
+        if instruction & 0x0FBF_0FFF == 0x010F_0000 {
+            let rd = ((instruction >> 12) & 0xF) as usize;
+            self.registers[rd] = self.cpsr;
+            return true;
+        }
+
+        // MUL / MLA — Multiply / Multiply-Accumulate
+        // Pattern: xxxx 0000 00xx xxxx xxxx xxxx 1001 xxxx
+        if instruction & 0x0FC0_00F0 == 0x0000_0090 {
+            let accumulate = (instruction >> 21) & 1 == 1;
+            let set_flags = (instruction >> 20) & 1 == 1;
+            let rd = ((instruction >> 16) & 0xF) as usize;
+            let rn = ((instruction >> 12) & 0xF) as usize;
+            let rs = ((instruction >> 8) & 0xF) as usize;
+            let rm = (instruction & 0xF) as usize;
+
+            let result = if accumulate {
+                // MLA: Rd = Rm * Rs + Rn
+                self.registers[rm].wrapping_mul(self.registers[rs]).wrapping_add(self.registers[rn])
+            } else {
+                // MUL: Rd = Rm * Rs
+                self.registers[rm].wrapping_mul(self.registers[rs])
+            };
+            self.registers[rd] = result;
+
+            if set_flags {
+                self.set_flag(CPSR_Z, result == 0);
+                self.set_flag(CPSR_N, (result >> 31) & 1 == 1);
+            }
+            return true;
+        }
+
+        // MULL / MLAL — Long Multiply (64-bit result)
+        // Pattern: xxxx 0000 1xxx xxxx xxxx xxxx 1001 xxxx
+        if instruction & 0x0F80_00F0 == 0x0080_0090 {
+            let is_signed = (instruction >> 22) & 1 == 1;
+            let accumulate = (instruction >> 21) & 1 == 1;
+            let set_flags = (instruction >> 20) & 1 == 1;
+            let rd_hi = ((instruction >> 16) & 0xF) as usize;
+            let rd_lo = ((instruction >> 12) & 0xF) as usize;
+            let rs = ((instruction >> 8) & 0xF) as usize;
+            let rm = (instruction & 0xF) as usize;
+
+            let result: u64 = if is_signed {
+                (self.registers[rm] as i32 as i64).wrapping_mul(self.registers[rs] as i32 as i64) as u64
+            } else {
+                (self.registers[rm] as u64).wrapping_mul(self.registers[rs] as u64)
+            };
+
+            let result = if accumulate {
+                let acc = ((self.registers[rd_hi] as u64) << 32) | (self.registers[rd_lo] as u64);
+                result.wrapping_add(acc)
+            } else {
+                result
+            };
+
+            self.registers[rd_lo] = result as u32;
+            self.registers[rd_hi] = (result >> 32) as u32;
+
+            if set_flags {
+                self.set_flag(CPSR_Z, result == 0);
+                self.set_flag(CPSR_N, (result >> 63) & 1 == 1);
+            }
+            return true;
+        }
+
+        false // Not a special instruction
+    }
+
+    // ========================================================================
+    // THUMB MODE
+    // ========================================================================
+    // THUMB instructions are 16 bits wide. They're a compressed form of ARM —
+    // fewer registers directly accessible (mostly R0-R7), simpler encodings,
+    // but the same ALU. Most GBA game code runs in THUMB mode.
+    //
+    // The CPU switches to THUMB via BX with bit 0 set in the target address.
+    // THUMB has ~19 instruction formats, identified by the top bits.
+
+    fn step_thumb(&mut self, bus: &mut crate::bus::Bus) -> bool {
+        let pc = self.registers[R_PC];
+        let instruction = bus.read_halfword(pc) as u32;
+
+        // Advance PC by 2 (THUMB instructions are 16 bits = 2 bytes)
+        self.registers[R_PC] = pc.wrapping_add(2);
+
+        if instruction == 0 {
+            return false; // Halt convention
+        }
+
+        // Decode by top bits — THUMB uses the top 3-6 bits to identify format
+        let top8 = (instruction >> 8) & 0xFF;
+        let top5 = (instruction >> 11) & 0x1F;
+        let top3 = (instruction >> 13) & 0x7;
+
+        match top3 {
+            0b000 => {
+                if top5 == 0b00011 {
+                    // Format 2: Add/Subtract (register or immediate)
+                    self.thumb_add_sub(instruction);
+                } else {
+                    // Format 1: Move shifted register (LSL, LSR, ASR)
+                    self.thumb_shift(instruction);
+                }
+            }
+            0b001 => {
+                // Format 3: Immediate operations (MOV, CMP, ADD, SUB with 8-bit immediate)
+                self.thumb_immediate(instruction);
+            }
+            0b010 => {
+                if top5 == 0b01000 {
+                    if (instruction >> 10) & 1 == 1 {
+                        // Format 5: Hi register operations / BX
+                        self.thumb_hi_reg_bx(instruction, bus);
+                    } else {
+                        // Format 4: ALU operations (16 ops between low registers)
+                        self.thumb_alu(instruction);
+                    }
+                } else if top5 == 0b01001 {
+                    // Format 6: PC-relative load (LDR Rd, [PC, #imm])
+                    self.thumb_pc_relative_load(instruction, bus);
+                } else {
+                    // Format 7/8: Load/store with register offset
+                    self.thumb_load_store_reg(instruction, bus);
+                }
+            }
+            0b011 => {
+                // Format 9: Load/store with immediate offset
+                self.thumb_load_store_imm(instruction, bus);
+            }
+            0b100 => {
+                if top5 & 0x1E == 0b10000 {
+                    // Format 10: Load/store halfword
+                    self.thumb_load_store_halfword(instruction, bus);
+                } else {
+                    // Format 11: SP-relative load/store
+                    self.thumb_sp_relative(instruction, bus);
+                }
+            }
+            0b101 => {
+                if top5 & 0x1E == 0b10100 {
+                    // Format 12: Load address (from PC or SP)
+                    self.thumb_load_address(instruction);
+                } else if top8 == 0b10110000 {
+                    // Format 13: Add offset to SP
+                    self.thumb_sp_offset(instruction);
+                } else if top5 & 0x1E == 0b10110 {
+                    // Format 14: Push/Pop registers
+                    self.thumb_push_pop(instruction, bus);
+                } else {
+                    // Unknown
+                }
+            }
+            0b110 => {
+                if top5 & 0x1E == 0b11000 {
+                    // Format 15: Multiple load/store (LDMIA/STMIA)
+                    self.thumb_multiple_load_store(instruction, bus);
+                } else if top5 == 0b11011 || top5 == 0b11010 {
+                    // Format 16: Conditional branch
+                    self.thumb_conditional_branch(instruction);
+                } else if top8 == 0b11011111 {
+                    // Format 17: SWI — later
+                }
+            }
+            0b111 => {
+                if top5 == 0b11100 {
+                    // Format 18: Unconditional branch (B)
+                    self.thumb_branch(instruction);
+                } else if top5 & 0x1E == 0b11110 {
+                    // Format 19: Long branch with link (BL, two-instruction sequence)
+                    self.thumb_long_branch(instruction);
+                }
+            }
+            _ => {}
+        }
+
+        true
+    }
+
+    // --- THUMB Format 1: Move shifted register ---
+    // LSL Rd, Rs, #Offset5 / LSR Rd, Rs, #Offset5 / ASR Rd, Rs, #Offset5
+    fn thumb_shift(&mut self, instruction: u32) {
+        let op = (instruction >> 11) & 0x3;
+        let offset = (instruction >> 6) & 0x1F;
+        let rs = ((instruction >> 3) & 0x7) as usize;
+        let rd = (instruction & 0x7) as usize;
+
+        let value = self.registers[rs];
+        // For LSR/ASR, shift of 0 means shift by 32
+        let (result, carry) = match op {
+            0 => self.barrel_shift(value, 0, offset),       // LSL
+            1 => {
+                let amt = if offset == 0 { 32 } else { offset };
+                self.barrel_shift(value, 1, amt)             // LSR
+            }
+            2 => {
+                let amt = if offset == 0 { 32 } else { offset };
+                self.barrel_shift(value, 2, amt)             // ASR
+            }
+            _ => (value, self.flag_c()),
+        };
+
+        self.registers[rd] = result;
+        self.set_flag(CPSR_N, (result >> 31) & 1 == 1);
+        self.set_flag(CPSR_Z, result == 0);
+        self.set_flag(CPSR_C, carry);
+    }
+
+    // --- THUMB Format 2: Add/Subtract ---
+    // ADD Rd, Rs, Rn/imm3 / SUB Rd, Rs, Rn/imm3
+    fn thumb_add_sub(&mut self, instruction: u32) {
+        let is_immediate = (instruction >> 10) & 1 == 1;
+        let is_sub = (instruction >> 9) & 1 == 1;
+        let rn_or_imm = ((instruction >> 6) & 0x7) as u32;
+        let rs = ((instruction >> 3) & 0x7) as usize;
+        let rd = (instruction & 0x7) as usize;
+
+        let op1 = self.registers[rs];
+        let op2 = if is_immediate { rn_or_imm } else { self.registers[rn_or_imm as usize] };
+
+        let result = if is_sub {
+            op1.wrapping_sub(op2)
+        } else {
+            op1.wrapping_add(op2)
+        };
+
+        self.registers[rd] = result;
+        self.set_flag(CPSR_N, (result >> 31) & 1 == 1);
+        self.set_flag(CPSR_Z, result == 0);
+        if is_sub {
+            self.set_flag(CPSR_C, op1 >= op2);
+            self.set_flag(CPSR_V, ((op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0);
+        } else {
+            self.set_flag(CPSR_C, (op1 as u64 + op2 as u64) > 0xFFFF_FFFF);
+            self.set_flag(CPSR_V, (!(op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0);
+        }
+    }
+
+    // --- THUMB Format 3: Immediate operations ---
+    // MOV Rd, #imm8 / CMP Rd, #imm8 / ADD Rd, #imm8 / SUB Rd, #imm8
+    fn thumb_immediate(&mut self, instruction: u32) {
+        let op = (instruction >> 11) & 0x3;
+        let rd = ((instruction >> 8) & 0x7) as usize;
+        let imm = instruction & 0xFF;
+
+        let rd_val = self.registers[rd];
+        let result = match op {
+            0 => imm,                           // MOV
+            1 => rd_val.wrapping_sub(imm),      // CMP
+            2 => rd_val.wrapping_add(imm),      // ADD
+            3 => rd_val.wrapping_sub(imm),      // SUB
+            _ => unreachable!(),
+        };
+
+        if op != 1 { // CMP doesn't store
+            self.registers[rd] = result;
+        }
+
+        self.set_flag(CPSR_N, (result >> 31) & 1 == 1);
+        self.set_flag(CPSR_Z, result == 0);
+        match op {
+            1 | 3 => { // CMP, SUB
+                self.set_flag(CPSR_C, rd_val >= imm);
+                self.set_flag(CPSR_V, ((rd_val ^ imm) & (rd_val ^ result) & 0x8000_0000) != 0);
+            }
+            2 => { // ADD
+                self.set_flag(CPSR_C, (rd_val as u64 + imm as u64) > 0xFFFF_FFFF);
+                self.set_flag(CPSR_V, (!(rd_val ^ imm) & (rd_val ^ result) & 0x8000_0000) != 0);
+            }
+            _ => {} // MOV doesn't change C/V
+        }
+    }
+
+    // --- THUMB Format 4: ALU operations ---
+    // 16 operations on low registers (R0-R7)
+    fn thumb_alu(&mut self, instruction: u32) {
+        let op = (instruction >> 6) & 0xF;
+        let rs = ((instruction >> 3) & 0x7) as usize;
+        let rd = (instruction & 0x7) as usize;
+
+        let a = self.registers[rd];
+        let b = self.registers[rs];
+
+        let result = match op {
+            0x0 => a & b,                                         // AND
+            0x1 => a ^ b,                                         // EOR
+            0x2 => { let (r, c) = self.barrel_shift(a, 0, b & 0xFF); self.set_flag(CPSR_C, c); r } // LSL
+            0x3 => { let (r, c) = self.barrel_shift(a, 1, b & 0xFF); self.set_flag(CPSR_C, c); r } // LSR
+            0x4 => { let (r, c) = self.barrel_shift(a, 2, b & 0xFF); self.set_flag(CPSR_C, c); r } // ASR
+            0x5 => { // ADC
+                let c = if self.flag_c() { 1u32 } else { 0 };
+                let r = a.wrapping_add(b).wrapping_add(c);
+                self.set_flag(CPSR_C, (a as u64 + b as u64 + c as u64) > 0xFFFF_FFFF);
+                self.set_flag(CPSR_V, (!(a ^ b) & (a ^ r) & 0x8000_0000) != 0);
+                r
+            }
+            0x6 => { // SBC
+                let c = if self.flag_c() { 1u32 } else { 0 };
+                let r = a.wrapping_sub(b).wrapping_add(c).wrapping_sub(1);
+                self.set_flag(CPSR_C, (a as u64) >= (b as u64 + 1 - c as u64));
+                self.set_flag(CPSR_V, ((a ^ b) & (a ^ r) & 0x8000_0000) != 0);
+                r
+            }
+            0x7 => { let (r, c) = self.barrel_shift(a, 3, b & 0xFF); self.set_flag(CPSR_C, c); r } // ROR
+            0x8 => { a & b } // TST (don't store)
+            0x9 => { // NEG: Rd = 0 - Rs
+                let r = 0u32.wrapping_sub(b);
+                self.set_flag(CPSR_C, b == 0);
+                self.set_flag(CPSR_V, (b & r & 0x8000_0000) != 0);
+                r
+            }
+            0xA => { // CMP
+                let r = a.wrapping_sub(b);
+                self.set_flag(CPSR_C, a >= b);
+                self.set_flag(CPSR_V, ((a ^ b) & (a ^ r) & 0x8000_0000) != 0);
+                r
+            }
+            0xB => { // CMN
+                let r = a.wrapping_add(b);
+                self.set_flag(CPSR_C, (a as u64 + b as u64) > 0xFFFF_FFFF);
+                self.set_flag(CPSR_V, (!(a ^ b) & (a ^ r) & 0x8000_0000) != 0);
+                r
+            }
+            0xC => a | b,                                          // ORR
+            0xD => a.wrapping_mul(b),                              // MUL
+            0xE => a & !b,                                         // BIC
+            0xF => !b,                                             // MVN
+            _ => unreachable!(),
+        };
+
+        let is_test = matches!(op, 0x8 | 0xA | 0xB); // TST, CMP, CMN don't store
+        if !is_test {
+            self.registers[rd] = result;
+        }
+        self.set_flag(CPSR_N, (result >> 31) & 1 == 1);
+        self.set_flag(CPSR_Z, result == 0);
+    }
+
+    // --- THUMB Format 5: Hi register operations / BX ---
+    // Can access R8-R15! ADD, CMP, MOV between any registers, or BX.
+    fn thumb_hi_reg_bx(&mut self, instruction: u32, _bus: &mut crate::bus::Bus) {
+        let op = (instruction >> 8) & 0x3;
+        let h1 = ((instruction >> 7) & 1) as usize; // High bit for Rd
+        let h2 = ((instruction >> 6) & 1) as usize; // High bit for Rs
+        let rs = (((instruction >> 3) & 0x7) as usize) | (h2 << 3);
+        let rd = ((instruction & 0x7) as usize) | (h1 << 3);
+
+        let rs_val = self.read_reg(rs);
+
+        match op {
+            0 => { // ADD
+                let rd_val = self.read_reg(rd);
+                self.registers[rd] = rd_val.wrapping_add(rs_val);
+            }
+            1 => { // CMP
+                let rd_val = self.read_reg(rd);
+                let result = rd_val.wrapping_sub(rs_val);
+                self.set_flag(CPSR_N, (result >> 31) & 1 == 1);
+                self.set_flag(CPSR_Z, result == 0);
+                self.set_flag(CPSR_C, rd_val >= rs_val);
+                self.set_flag(CPSR_V, ((rd_val ^ rs_val) & (rd_val ^ result) & 0x8000_0000) != 0);
+            }
+            2 => { // MOV
+                self.registers[rd] = rs_val;
+            }
+            3 => { // BX
+                if rs_val & 1 != 0 {
+                    self.cpsr |= CPSR_T;
+                    self.registers[R_PC] = rs_val & !1;
+                } else {
+                    self.cpsr &= !CPSR_T;
+                    self.registers[R_PC] = rs_val & !3;
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    // --- THUMB Format 6: PC-relative load ---
+    // LDR Rd, [PC, #imm8*4]
+    fn thumb_pc_relative_load(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        let rd = ((instruction >> 8) & 0x7) as usize;
+        let offset = (instruction & 0xFF) << 2;
+        // PC is word-aligned for this instruction
+        let base = self.read_reg(R_PC) & !3;
+        self.registers[rd] = bus.read_word(base.wrapping_add(offset));
+    }
+
+    // --- THUMB Format 7/8: Load/store with register offset ---
+    fn thumb_load_store_reg(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        let ro = ((instruction >> 6) & 0x7) as usize;
+        let rb = ((instruction >> 3) & 0x7) as usize;
+        let rd = (instruction & 0x7) as usize;
+        let addr = self.registers[rb].wrapping_add(self.registers[ro]);
+
+        let is_format8 = (instruction >> 9) & 1 == 1;
+
+        if is_format8 {
+            // Format 8: halfword/sign-extended
+            let op = (instruction >> 10) & 0x3;
+            match op {
+                0 => bus.write_halfword(addr, self.registers[rd] as u16),   // STRH
+                1 => self.registers[rd] = bus.read_byte(addr) as i8 as i32 as u32,  // LDSB
+                2 => self.registers[rd] = bus.read_halfword(addr) as u32,   // LDRH
+                3 => self.registers[rd] = bus.read_halfword(addr) as i16 as i32 as u32, // LDSH
+                _ => unreachable!(),
+            }
+        } else {
+            // Format 7: byte/word
+            let is_load = (instruction >> 11) & 1 == 1;
+            let is_byte = (instruction >> 10) & 1 == 1;
+            if is_load {
+                self.registers[rd] = if is_byte {
+                    bus.read_byte(addr) as u32
+                } else {
+                    bus.read_word(addr)
+                };
+            } else {
+                if is_byte {
+                    bus.write_byte(addr, self.registers[rd] as u8);
+                } else {
+                    bus.write_word(addr, self.registers[rd]);
+                }
+            }
+        }
+    }
+
+    // --- THUMB Format 9: Load/store with immediate offset ---
+    fn thumb_load_store_imm(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        let is_load = (instruction >> 11) & 1 == 1;
+        let is_byte = (instruction >> 12) & 1 == 1;
+        let offset = (instruction >> 6) & 0x1F;
+        let rb = ((instruction >> 3) & 0x7) as usize;
+        let rd = (instruction & 0x7) as usize;
+
+        let offset = if is_byte { offset } else { offset << 2 }; // Word offset * 4
+        let addr = self.registers[rb].wrapping_add(offset);
+
+        if is_load {
+            self.registers[rd] = if is_byte {
+                bus.read_byte(addr) as u32
+            } else {
+                bus.read_word(addr)
+            };
+        } else {
+            if is_byte {
+                bus.write_byte(addr, self.registers[rd] as u8);
+            } else {
+                bus.write_word(addr, self.registers[rd]);
+            }
+        }
+    }
+
+    // --- THUMB Format 10: Load/store halfword ---
+    fn thumb_load_store_halfword(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        let is_load = (instruction >> 11) & 1 == 1;
+        let offset = ((instruction >> 6) & 0x1F) << 1; // Halfword offset * 2
+        let rb = ((instruction >> 3) & 0x7) as usize;
+        let rd = (instruction & 0x7) as usize;
+        let addr = self.registers[rb].wrapping_add(offset);
+
+        if is_load {
+            self.registers[rd] = bus.read_halfword(addr) as u32;
+        } else {
+            bus.write_halfword(addr, self.registers[rd] as u16);
+        }
+    }
+
+    // --- THUMB Format 11: SP-relative load/store ---
+    fn thumb_sp_relative(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        let is_load = (instruction >> 11) & 1 == 1;
+        let rd = ((instruction >> 8) & 0x7) as usize;
+        let offset = (instruction & 0xFF) << 2;
+        let addr = self.registers[R_SP].wrapping_add(offset);
+
+        if is_load {
+            self.registers[rd] = bus.read_word(addr);
+        } else {
+            bus.write_word(addr, self.registers[rd]);
+        }
+    }
+
+    // --- THUMB Format 12: Load address ---
+    // ADD Rd, PC/SP, #imm8*4
+    fn thumb_load_address(&mut self, instruction: u32) {
+        let is_sp = (instruction >> 11) & 1 == 1;
+        let rd = ((instruction >> 8) & 0x7) as usize;
+        let offset = (instruction & 0xFF) << 2;
+
+        let base = if is_sp {
+            self.registers[R_SP]
+        } else {
+            self.read_reg(R_PC) & !3 // PC, word-aligned
+        };
+        self.registers[rd] = base.wrapping_add(offset);
+    }
+
+    // --- THUMB Format 13: Add offset to SP ---
+    fn thumb_sp_offset(&mut self, instruction: u32) {
+        let offset = (instruction & 0x7F) << 2;
+        if (instruction >> 7) & 1 == 1 {
+            self.registers[R_SP] = self.registers[R_SP].wrapping_sub(offset);
+        } else {
+            self.registers[R_SP] = self.registers[R_SP].wrapping_add(offset);
+        }
+    }
+
+    // --- THUMB Format 14: Push/Pop ---
+    fn thumb_push_pop(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        let is_pop = (instruction >> 11) & 1 == 1;
+        let store_lr_load_pc = (instruction >> 8) & 1 == 1;
+        let reg_list = instruction & 0xFF;
+
+        if is_pop {
+            // POP {Rlist} — load registers from stack
+            let mut addr = self.registers[R_SP];
+            for i in 0..8 {
+                if reg_list & (1 << i) != 0 {
+                    self.registers[i] = bus.read_word(addr);
+                    addr = addr.wrapping_add(4);
+                }
+            }
+            if store_lr_load_pc {
+                let val = bus.read_word(addr);
+                // POP {PC} can switch to ARM mode if bit 0 is clear
+                if val & 1 != 0 {
+                    self.registers[R_PC] = val & !1;
+                } else {
+                    self.cpsr &= !CPSR_T;
+                    self.registers[R_PC] = val & !3;
+                }
+                addr = addr.wrapping_add(4);
+            }
+            self.registers[R_SP] = addr;
+        } else {
+            // PUSH {Rlist} — store registers to stack
+            let mut count = 0u32;
+            for i in 0..8 {
+                if reg_list & (1 << i) != 0 { count += 1; }
+            }
+            if store_lr_load_pc { count += 1; }
+
+            let mut addr = self.registers[R_SP].wrapping_sub(count * 4);
+            self.registers[R_SP] = addr;
+
+            for i in 0..8 {
+                if reg_list & (1 << i) != 0 {
+                    bus.write_word(addr, self.registers[i]);
+                    addr = addr.wrapping_add(4);
+                }
+            }
+            if store_lr_load_pc {
+                bus.write_word(addr, self.registers[R_LR]);
+            }
+        }
+    }
+
+    // --- THUMB Format 15: Multiple load/store ---
+    fn thumb_multiple_load_store(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        let is_load = (instruction >> 11) & 1 == 1;
+        let rb = ((instruction >> 8) & 0x7) as usize;
+        let reg_list = instruction & 0xFF;
+        let mut addr = self.registers[rb];
+
+        for i in 0..8 {
+            if reg_list & (1 << i) != 0 {
+                if is_load {
+                    self.registers[i] = bus.read_word(addr);
+                } else {
+                    bus.write_word(addr, self.registers[i]);
+                }
+                addr = addr.wrapping_add(4);
+            }
+        }
+        self.registers[rb] = addr; // Write-back
+    }
+
+    // --- THUMB Format 16: Conditional branch ---
+    fn thumb_conditional_branch(&mut self, instruction: u32) {
+        let cond = (instruction >> 8) & 0xF;
+        if !self.condition_met(cond) {
+            return;
+        }
+        // 8-bit signed offset, in units of 2 bytes
+        let mut offset = instruction & 0xFF;
+        if offset & 0x80 != 0 {
+            offset |= 0xFFFF_FF00; // Sign extend
+        }
+        let offset = (offset << 1) as i32;
+        let pc = self.read_reg(R_PC); // PC + 4 in THUMB
+        self.registers[R_PC] = (pc as i32).wrapping_add(offset) as u32;
+    }
+
+    // --- THUMB Format 18: Unconditional branch ---
+    fn thumb_branch(&mut self, instruction: u32) {
+        let mut offset = instruction & 0x7FF;
+        if offset & 0x400 != 0 {
+            offset |= 0xFFFF_F800; // Sign extend 11-bit
+        }
+        let offset = (offset << 1) as i32;
+        let pc = self.read_reg(R_PC);
+        self.registers[R_PC] = (pc as i32).wrapping_add(offset) as u32;
+    }
+
+    // --- THUMB Format 19: Long branch with link (BL) ---
+    // This is a two-instruction sequence:
+    //   Instruction 1 (H=0): LR = PC + (offset_high << 12)
+    //   Instruction 2 (H=1): PC = LR + (offset_low << 1), LR = old_PC | 1
+    fn thumb_long_branch(&mut self, instruction: u32) {
+        let h = (instruction >> 11) & 1;
+        let offset = instruction & 0x7FF;
+
+        if h == 0 {
+            // First instruction: set up LR with high part of offset
+            let mut off = offset << 12;
+            if off & 0x0040_0000 != 0 {
+                off |= 0xFF80_0000; // Sign extend 23-bit
+            }
+            let pc = self.read_reg(R_PC);
+            self.registers[R_LR] = pc.wrapping_add(off);
+        } else {
+            // Second instruction: jump and link
+            let target = self.registers[R_LR].wrapping_add(offset << 1);
+            self.registers[R_LR] = (self.registers[R_PC].wrapping_sub(2)) | 1; // Return addr with THUMB bit
+            self.registers[R_PC] = target & !1;
+        }
     }
 
     // --- Data Processing (ALU) ---

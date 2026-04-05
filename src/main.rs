@@ -34,31 +34,64 @@ fn main() {
     println!("{:<10} {:<12} {:<30} Registers", "PC", "Hex", "Instruction");
     println!("{}", "-".repeat(80));
 
-    let max_steps = 20; // Safety limit
+    let max_steps = 500_000; // Safety limit
+    let verbose = args.iter().any(|a| a == "-v");
+    let mut last_pc = 0u32;
+    let mut stuck_count = 0u32;
+
     for step in 0..max_steps {
         let pc = cpu.registers[R_PC];
-        let instruction = bus.read_word(pc);
+        let in_thumb = cpu.in_thumb_mode();
 
-        // Stop on zero (our halt convention)
-        if instruction == 0 {
-            println!("\n[HALT] Encountered instruction 0x00000000 at PC=0x{:08X}", pc);
+        // Detect infinite loops (same PC twice in a row = stuck)
+        if pc == last_pc {
+            stuck_count += 1;
+            if stuck_count > 2 {
+                println!("[STUCK] Infinite loop at PC=0x{:08X} after {} steps", pc, step);
+                break;
+            }
+        } else {
+            stuck_count = 0;
+        }
+        last_pc = pc;
+
+        let is_halt = if in_thumb {
+            bus.read_halfword(pc) == 0
+        } else {
+            bus.read_word(pc) == 0
+        };
+
+        if is_halt {
+            println!("[HALT] instruction=0 at PC=0x{:08X} after {} steps", pc, step);
             break;
         }
 
-        // Disassemble (basic) before executing
-        let disasm = disassemble_arm(instruction);
-        print!("0x{:08X} 0x{:08X}   {:<30}", pc, instruction, disasm);
+        // Print first 20, mode switches, and periodic updates
+        let should_print = verbose || step < 20 || step % 50000 == 0;
+        if should_print {
+            let desc = if in_thumb {
+                format!("T:{:04X}", bus.read_halfword(pc))
+            } else {
+                let inst = bus.read_word(pc);
+                disassemble_arm(inst)
+            };
+            print!("{:>6} 0x{:08X}  {:<28}", step, pc, desc);
+        }
 
-        // Execute
         let should_continue = cpu.step(&mut bus);
 
-        // Show key registers after execution
-        println!("R0={} R1={} R2={} R3={}",
-            cpu.registers[0], cpu.registers[1],
-            cpu.registers[2], cpu.registers[3]);
+        if should_print {
+            let mode_switch = in_thumb != cpu.in_thumb_mode();
+            println!("R0=0x{:08X} R1=0x{:08X}{}",
+                cpu.registers[0], cpu.registers[1],
+                if mode_switch { "  [MODE SWITCH]" } else { "" });
+        } else if in_thumb != cpu.in_thumb_mode() {
+            println!("{:>6} 0x{:08X}  [MODE SWITCH → {}]",
+                step, pc, if cpu.in_thumb_mode() { "THUMB" } else { "ARM" });
+        }
 
         if !should_continue {
-            println!("\n[HALT] CPU halted after {} steps", step + 1);
+            println!("[HALT] CPU halted after {} steps", step + 1);
             break;
         }
 
