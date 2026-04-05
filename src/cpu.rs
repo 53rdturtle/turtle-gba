@@ -301,6 +301,16 @@ impl Cpu {
                 if self.try_special_arm(instruction, bus) {
                     return true;
                 }
+                // Halfword/signed transfer: bits 27-26=00, bit 7=1, bit 4=1, bit 25=0
+                // Pattern: xxxx 000x xxxx xxxx xxxx xxxx 1xx1 xxxx
+                if bit_25 == 0 && (instruction & 0x90) == 0x90 && (instruction & 0x0200_0000) == 0 {
+                    let sh = (instruction >> 5) & 0x3;
+                    if sh != 0 {
+                        // Halfword / signed byte transfer
+                        self.execute_halfword_transfer(instruction, bus);
+                        return true;
+                    }
+                }
                 // Data processing (ALU operations): MOV, ADD, SUB, CMP, AND, ORR, etc.
                 self.execute_data_processing(instruction, bit_25);
             }
@@ -312,11 +322,17 @@ impl Cpu {
                 if (instruction >> 25) & 1 == 1 {
                     // Branch (B) and Branch with Link (BL)
                     self.execute_branch(instruction);
+                } else {
+                    // Block data transfer (LDM/STM)
+                    self.execute_block_transfer(instruction, bus);
                 }
-                // else: block data transfer (LDM/STM) — later
             }
             0b11 => {
-                // Coprocessor / SWI — later
+                if (instruction >> 24) & 0xF == 0xF {
+                    // SWI — Software Interrupt (BIOS call)
+                    self.execute_swi(instruction, bus);
+                }
+                // else: Coprocessor — later
             }
             _ => unreachable!(),
         }
@@ -534,7 +550,8 @@ impl Cpu {
                     // Format 16: Conditional branch
                     self.thumb_conditional_branch(instruction);
                 } else if top8 == 0b11011111 {
-                    // Format 17: SWI — later
+                    // Format 17: SWI (Software Interrupt)
+                    self.execute_swi_thumb(instruction, bus);
                 }
             }
             0b111 => {
@@ -1181,6 +1198,207 @@ impl Cpu {
         // Post-index: update base register after the transfer
         if !pre_index {
             self.registers[rn] = addr;
+        }
+    }
+
+    // --- Block Data Transfer (LDM / STM) ---
+    // Load/store multiple registers at once. Used for push/pop and fast memory copy.
+    //
+    // Encoding:
+    //   bit 24: P (pre/post indexing)
+    //   bit 23: U (up/down — add or subtract offset)
+    //   bit 22: S (load PSR or force user mode)
+    //   bit 21: W (write-back — update base register)
+    //   bit 20: L (load/store)
+    //   bits 19-16: Rn (base register)
+    //   bits 15-0: register list (bit N = register N)
+    //
+    // Common forms:
+    //   STMFD SP!, {R4-R7, LR}  → push registers (Full Descending = pre-decrement)
+    //   LDMFD SP!, {R4-R7, PC}  → pop registers (Full Descending = post-increment)
+
+    fn execute_block_transfer(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        let pre = (instruction >> 24) & 1 == 1;
+        let up = (instruction >> 23) & 1 == 1;
+        let write_back = (instruction >> 21) & 1 == 1;
+        let is_load = (instruction >> 20) & 1 == 1;
+        let rn = ((instruction >> 16) & 0xF) as usize;
+        let reg_list = instruction & 0xFFFF;
+
+        let mut addr = self.registers[rn];
+
+        // Count registers to transfer
+        let count = reg_list.count_ones();
+
+        // For descending (down), we start from base - count * 4
+        if !up {
+            addr = addr.wrapping_sub(count * 4);
+            if write_back {
+                self.registers[rn] = addr;
+            }
+            // When going down, we still store low-to-high in memory
+            // So we just changed the start address; now process upward
+            for i in 0..16u32 {
+                if reg_list & (1 << i) != 0 {
+                    let ea = if pre { addr.wrapping_add(4) } else { addr };
+                    if is_load {
+                        self.registers[i as usize] = bus.read_word(ea);
+                    } else {
+                        bus.write_word(ea, self.registers[i as usize]);
+                    }
+                    addr = addr.wrapping_add(4);
+                }
+            }
+        } else {
+            // Ascending (up)
+            for i in 0..16u32 {
+                if reg_list & (1 << i) != 0 {
+                    let ea = if pre { addr.wrapping_add(4) } else { addr };
+                    if is_load {
+                        self.registers[i as usize] = bus.read_word(ea);
+                    } else {
+                        bus.write_word(ea, self.registers[i as usize]);
+                    }
+                    addr = addr.wrapping_add(4);
+                }
+            }
+            if write_back {
+                self.registers[rn] = if pre { addr } else { addr };
+            }
+        }
+
+        // If we loaded PC, check for THUMB switch
+        if is_load && reg_list & (1 << 15) != 0 {
+            let new_pc = self.registers[R_PC];
+            if new_pc & 1 != 0 {
+                self.cpsr |= CPSR_T;
+                self.registers[R_PC] = new_pc & !1;
+            } else {
+                self.cpsr &= !CPSR_T;
+                self.registers[R_PC] = new_pc & !3;
+            }
+        }
+    }
+
+    // --- Halfword / Signed Byte Transfer (LDRH/STRH/LDSB/LDSH) ---
+    // These transfer 16-bit or sign-extended 8-bit values.
+    //
+    // Encoding (bits 27-26=00, bits 7,4=1,1):
+    //   bit 24: P (pre/post)
+    //   bit 23: U (add/subtract offset)
+    //   bit 22: I (1=immediate offset, 0=register offset)
+    //   bit 21: W (write-back)
+    //   bit 20: L (load/store)
+    //   bits 6-5: SH (00=SWP, 01=unsigned halfword, 10=signed byte, 11=signed halfword)
+    //   offset: if I=1, (bits 11-8 << 4) | bits 3-0; if I=0, Rm
+
+    fn execute_halfword_transfer(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        let pre = (instruction >> 24) & 1 == 1;
+        let up = (instruction >> 23) & 1 == 1;
+        let is_imm = (instruction >> 22) & 1 == 1;
+        let write_back = (instruction >> 21) & 1 == 1;
+        let is_load = (instruction >> 20) & 1 == 1;
+        let rn = ((instruction >> 16) & 0xF) as usize;
+        let rd = ((instruction >> 12) & 0xF) as usize;
+        let sh = (instruction >> 5) & 0x3;
+
+        let offset = if is_imm {
+            ((instruction >> 4) & 0xF0) | (instruction & 0xF)
+        } else {
+            let rm = (instruction & 0xF) as usize;
+            self.registers[rm]
+        };
+
+        let base = self.read_reg(rn);
+        let addr = if up {
+            base.wrapping_add(offset)
+        } else {
+            base.wrapping_sub(offset)
+        };
+
+        let effective = if pre { addr } else { base };
+
+        if is_load {
+            self.registers[rd] = match sh {
+                1 => bus.read_halfword(effective) as u32,                    // LDRH
+                2 => bus.read_byte(effective) as i8 as i32 as u32,          // LDRSB
+                3 => bus.read_halfword(effective) as i16 as i32 as u32,     // LDRSH
+                _ => 0,
+            };
+        } else {
+            // STRH (sh=1 for store)
+            bus.write_halfword(effective, self.registers[rd] as u16);
+        }
+
+        if write_back || !pre {
+            self.registers[rn] = addr;
+        }
+    }
+
+    // --- SWI (Software Interrupt) — BIOS HLE ---
+    // Real GBA: SWI jumps to BIOS code at 0x00000008 which handles the request.
+    // We emulate the BIOS functions directly (High Level Emulation / HLE).
+    // The function number is in the top 8 bits of the SWI comment field (bits 23-16)
+    // in ARM mode, or bits 7-0 in THUMB mode.
+
+    fn execute_swi(&mut self, _instruction: u32, bus: &mut crate::bus::Bus) {
+        // In ARM mode, the function number is in bits 23-16
+        let comment = (_instruction >> 16) & 0xFF;
+        self.handle_bios_call(comment, bus);
+    }
+
+    pub fn execute_swi_thumb(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
+        // In THUMB mode, function number is bits 7-0
+        let comment = instruction & 0xFF;
+        self.handle_bios_call(comment, bus);
+    }
+
+    fn handle_bios_call(&mut self, function: u32, bus: &mut crate::bus::Bus) {
+        match function {
+            0x00 => { /* SoftReset — not implemented */ }
+            0x05 => { /* VBlankIntrWait — stub: just return */ }
+            0x06 => {
+                // Div: R0 = R0 / R1, R1 = R0 % R1, R3 = abs(R0/R1)
+                let num = self.registers[0] as i32;
+                let den = self.registers[1] as i32;
+                if den != 0 {
+                    self.registers[0] = (num / den) as u32;
+                    self.registers[1] = (num % den) as u32;
+                    self.registers[3] = (num / den).unsigned_abs();
+                }
+            }
+            0x08 => {
+                // Sqrt: R0 = sqrt(R0)
+                let val = self.registers[0] as f64;
+                self.registers[0] = val.sqrt() as u32;
+            }
+            0x0B | 0x0C => {
+                // CpuSet / CpuFastSet — memory copy/fill
+                // R0 = source, R1 = dest, R2 = length/mode
+                let src = self.registers[0];
+                let dst = self.registers[1];
+                let control = self.registers[2];
+                let count = control & 0x000F_FFFF;
+                let is_fill = (control >> 24) & 1 == 1;
+                let is_32bit = function == 0x0C || (control >> 26) & 1 == 1;
+
+                if is_32bit {
+                    let fill_val = if is_fill { bus.read_word(src) } else { 0 };
+                    for i in 0..count {
+                        let val = if is_fill { fill_val } else { bus.read_word(src.wrapping_add(i * 4)) };
+                        bus.write_word(dst.wrapping_add(i * 4), val);
+                    }
+                } else {
+                    let fill_val = if is_fill { bus.read_halfword(src) } else { 0 };
+                    for i in 0..count {
+                        let val = if is_fill { fill_val } else { bus.read_halfword(src.wrapping_add(i * 2)) };
+                        bus.write_halfword(dst.wrapping_add(i * 2), val);
+                    }
+                }
+            }
+            _ => {
+                // Unknown BIOS call — ignore for now
+            }
         }
     }
 }
