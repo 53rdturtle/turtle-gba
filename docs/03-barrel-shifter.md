@@ -2,22 +2,25 @@
 
 ## What is a Barrel Shifter?
 
-ARM's secret weapon: the second operand of any ALU instruction can be **shifted for free** — no extra instruction needed. This means `ADD R2, R0, R1, LSL #2` (add R0 + R1×4) is a single instruction.
+ARM's secret weapon: the second operand of any ALU (Arithmetic Logic Unit) instruction can be **shifted for free** — no extra instruction needed. "Shifting" means sliding all the bits in a number left or right, which is equivalent to multiplying or dividing by powers of 2. This means `ADD R2, R0, R1, LSL #2` (add R0 + R1×4) is a single instruction.
 
 ## Shift Types
 
+There are four types. Each shifts bits in a different way:
+
 ```
-LSL (Logical Shift Left)     — bits move left, 0s fill from right
+LSL (Logical Shift Left)     — bits move left, 0s fill from the right
   00000011 LSL #2  →  00001100     (multiply by 4)
 
-LSR (Logical Shift Right)    — bits move right, 0s fill from left
+LSR (Logical Shift Right)    — bits move right, 0s fill from the left
   00001100 LSR #2  →  00000011     (unsigned divide by 4)
 
-ASR (Arithmetic Shift Right) — bits move right, SIGN BIT fills from left
+ASR (Arithmetic Shift Right) — bits move right, the SIGN BIT fills from left
   11110000 ASR #2  →  11111100     (signed divide by 4, stays negative!)
+  (The "sign bit" is the leftmost bit — 1 means negative in signed numbers)
 
 ROR (Rotate Right)           — bits that fall off the right wrap to the left
-  00001101 ROR #2  →  01000011     (circular rotation)
+  00001101 ROR #2  →  01000011     (circular rotation, no bits are lost)
 ```
 
 ## Why It Matters

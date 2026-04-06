@@ -2,7 +2,7 @@
 
 ## GBA ROM Format
 
-A GBA ROM is just a binary file (usually `.gba`) loaded at address `0x08000000`. It has a header:
+A GBA ROM (Read-Only Memory — the game cartridge data) is just a binary file (usually `.gba`) loaded at address `0x08000000` in the GBA's memory map. It has a header:
 
 ```
 Offset  Size    Purpose
@@ -15,7 +15,7 @@ Offset  Size    Purpose
 0x0C0+  ...     Your code starts here
 ```
 
-The very first instruction at offset 0 is always a branch (`B start`) that jumps over the header. On real hardware the BIOS checks the Nintendo logo and checksum — our emulator skips these checks.
+The very first instruction at offset 0 is always a branch (`B start`) that jumps over the header. On real hardware the BIOS (Basic Input/Output System — the GBA's built-in startup code) checks the Nintendo logo and checksum — our emulator skips these checks.
 
 ## Our Test Program
 
@@ -31,7 +31,7 @@ loop:     ADD R0, R0, #1    ; counter++
           ADD R2, R2, R0    ; sum += counter
           CMP R0, R1        ; done?
           BNE loop          ; if not, keep going
-          STR R2, [R3]      ; store result to IWRAM
+          STR R2, [R3]      ; store result to IWRAM (Internal Work RAM)
 ```
 
 ## Execution Trace
@@ -70,7 +70,7 @@ We added a basic disassembler that converts hex instructions back to readable te
 ## What's Next
 
 Our CPU runs hand-crafted programs correctly. To run real GBA games we need:
-- More instruction types (MUL, LDM/STM, halfword loads, etc.)
-- THUMB mode (16-bit instructions)
-- PPU (graphics rendering)
-- Interrupt handling
+- More instruction types (MUL = Multiply, LDM/STM = Load/Store Multiple registers, halfword loads, etc.)
+- THUMB mode (the 16-bit compressed instruction set — see milestone 05)
+- PPU (Pixel Processing Unit — the graphics rendering hardware)
+- Interrupt handling (how the hardware notifies the CPU of events)

@@ -13,11 +13,11 @@ The ARM7TDMI CPU has **16 registers**, each a 32-bit number (`u32` in Rust):
 | Register | Name | Purpose |
 |----------|------|---------|
 | R0-R12 | General purpose | Store whatever the program needs |
-| R13 | **SP** (Stack Pointer) | Tracks the top of the stack |
-| R14 | **LR** (Link Register) | Return address after function calls |
-| R15 | **PC** (Program Counter) | Points to the **next instruction** to execute |
+| R13 | **SP (Stack Pointer)** | Tracks the top of the stack (a region of memory used for temporary data) |
+| R14 | **LR (Link Register)** | Stores the return address after function calls (so the CPU knows where to go back) |
+| R15 | **PC (Program Counter)** | Points to the **next instruction** to execute — the CPU's "current position" in the program |
 
-The **CPSR** (Current Program Status Register) holds condition flags:
+The **CPSR (Current Program Status Register)** holds condition flags — single bits that describe the result of the last operation:
 - **N** (bit 31) — result was Negative
 - **Z** (bit 30) — result was Zero
 - **C** (bit 29) — Carry occurred
@@ -39,14 +39,14 @@ This is **fundamental to emulation** — real hardware is all bits.
 The GBA's address space is 32-bit (addresses 0x00000000 to 0xFFFFFFFF), but only certain ranges are used:
 
 ```
-0x00000000  BIOS       (16 KB)  — built-in startup code, read-only
-0x02000000  EWRAM      (256 KB) — external RAM, general purpose, slower
-0x03000000  IWRAM      (32 KB)  — internal RAM, fast (on the CPU chip)
-0x04000000  I/O Regs   (1 KB)   — control hardware by writing here
-0x05000000  Palette    (1 KB)   — color data for graphics
-0x06000000  VRAM       (96 KB)  — graphics tile/bitmap data
-0x07000000  OAM        (1 KB)   — sprite attributes
-0x08000000  ROM        (≤32 MB) — the game cartridge
+0x00000000  BIOS       (16 KB)  — Basic Input/Output System, built-in startup code, read-only
+0x02000000  EWRAM      (256 KB) — External Work RAM (Random Access Memory), general purpose, slower
+0x03000000  IWRAM      (32 KB)  — Internal Work RAM, fast (on the CPU chip itself)
+0x04000000  I/O Regs   (1 KB)   — Input/Output Registers, control hardware by writing here
+0x05000000  Palette    (1 KB)   — color data for graphics (which colors the screen can use)
+0x06000000  VRAM       (96 KB)  — Video RAM, stores graphics tile/bitmap data
+0x07000000  OAM        (1 KB)   — Object Attribute Memory, stores sprite positions and properties
+0x08000000  ROM        (≤32 MB) — Read-Only Memory, the game cartridge data
 ```
 
 ### Memory-Mapped I/O

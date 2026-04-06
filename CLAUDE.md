@@ -33,6 +33,7 @@ This project follows an educational-first approach. Claude must:
 ### General Guidelines
 - **Prefer clarity over cleverness** — readable code that teaches is better than optimized code that obscures.
 - **Use real GBA terminology** — T-bit, THUMB mode, OAM, VRAM, etc. — and define terms on first use.
+- **Jargon rule**: On the **first appearance** of any abbreviation or technical term in a doc, always write the full name followed by the abbreviation in parentheses, e.g. "Program Counter (PC)", "Vertical Blank (VBlank)", "Pixel Processing Unit (PPU)". After that, the abbreviation alone is fine. This applies to docs/, code comments when introducing a concept, and chat explanations.
 - **Reference GBA documentation** — mention GBATEK/Tonc/other references when relevant so the user can read further.
 - **Break work into learning milestones**, not just implementation tasks.
 - **When the user asks "why"**, give a thorough answer rooted in how the actual hardware works.
@@ -53,6 +54,14 @@ This project follows an educational-first approach. Claude must:
 
 - Language: **Rust**
 - No external emulation libraries — we build from scratch to learn
+
+## Debugging Strategy
+
+Use **log-driven debugging**: when something isn't working, add targeted logging/tracing to the emulator output to observe actual behavior before theorizing. Let the data tell you what's wrong rather than guessing from code reading alone. Key principles:
+- Add trace output at decision points (branch taken/not-taken, mode switches, decoded values)
+- Compare expected vs actual values in the log
+- Narrow down by bisecting: find the first step where behavior diverges from expected
+- Remove debug logging after the bug is fixed
 
 ## References
 

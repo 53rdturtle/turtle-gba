@@ -8,10 +8,10 @@ Every CPU cycle follows the same pattern:
 FETCH ──► DECODE ──► EXECUTE ──► advance PC ──► repeat
 ```
 
-1. **Fetch**: Read 4 bytes from the address in PC → that's one ARM instruction
+1. **Fetch**: Read 4 bytes from the address in the PC (Program Counter) → that's one ARM instruction
 2. **Decode**: Look at specific bits to determine the operation
 3. **Execute**: Perform the operation (math, memory access, branch)
-4. **Advance PC**: Move PC forward by 4 (to the next instruction)
+4. **Advance PC**: Move PC forward by 4 bytes (to the next instruction)
 
 ## ARM Instruction Encoding
 
@@ -43,10 +43,10 @@ Example: `MOVEQ R1, #99` only executes if Z flag is set (previous comparison was
 
 | 27-26 | Category | Examples |
 |-------|----------|----------|
-| 00 | Data processing (ALU) | MOV, ADD, SUB, CMP, AND, ORR |
-| 01 | Memory transfer | LDR (load), STR (store) |
-| 10 | Branch | B (jump), BL (function call) |
-| 11 | Coprocessor / SWI | System calls (later) |
+| 00 | Data processing (ALU — Arithmetic Logic Unit) | MOV, ADD, SUB, CMP, AND, ORR |
+| 01 | Memory transfer | LDR (Load Register), STR (Store Register) |
+| 10 | Branch | B (Branch/jump), BL (Branch with Link — function call) |
+| 11 | Coprocessor / SWI (Software Interrupt) | System calls (later) |
 
 ## Data Processing (ALU Operations)
 
@@ -76,7 +76,7 @@ Jumps to a different address. The offset is:
 - Measured in **words** (multiply by 4 to get byte offset)
 - **Sign extension**: if bit 23 is 1, the offset is negative — fill upper bits with 1s
 
-**BL** (Branch with Link) saves the return address in LR first — this is how function calls work.
+**BL (Branch with Link)** saves the return address in LR (Link Register) first — this is how function calls work. The called function can later jump back to LR to "return."
 
 ## Load/Store (LDR/STR)
 
@@ -105,6 +105,6 @@ The CPU doesn't see "MOV" — it sees a 32-bit number and extracts meaning from 
 ## What's Next
 
 We have a working CPU that can do math, make decisions, and access memory. Next we could:
-- Add shift operations (LSL, LSR, ASR, ROR) for operand2
-- Implement THUMB mode (16-bit compressed instructions)
+- Add shift operations (LSL = Logical Shift Left, LSR = Logical Shift Right, ASR = Arithmetic Shift Right, ROR = Rotate Right) for operand2
+- Implement THUMB mode (a compressed 16-bit instruction set — see milestone 05)
 - Start loading and running a real test ROM
