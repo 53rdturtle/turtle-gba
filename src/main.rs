@@ -1,10 +1,23 @@
 mod bus;
 mod cpu;
+mod ppu;
 
 use bus::Bus;
 use cpu::{Cpu, R_PC, R_SP, R_LR};
+use ppu::{SCREEN_WIDTH, SCREEN_HEIGHT};
 use std::env;
 use std::fs;
+
+use minifb::{Key, Window, WindowOptions};
+
+/// Cycles per frame on the GBA: 228 scanlines × 1232 cycles each = 280,896.
+const CYCLES_PER_FRAME: u32 = 280_896;
+
+/// How many GBA frames to simulate per window frame.
+/// minifb only updates key state on window.update(), so this must be 1
+/// for responsive input. (Higher values cause input lag because
+/// is_key_down() returns stale data between update() calls.)
+const FRAMES_PER_RENDER: u32 = 1;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -12,29 +25,306 @@ fn main() {
     let mut cpu = Cpu::new();
     let mut bus = Bus::new();
 
-    if args.len() > 1 {
-        // Load ROM from file
-        let rom_path = &args[1];
+    println!("Turtle GBA Emulator");
+
+    // Try to load BIOS from common locations
+    let bios_paths = ["roms/gba_bios.bin", "gba_bios.bin", "bios.bin"];
+    let mut bios_loaded = false;
+    for path in &bios_paths {
+        if let Ok(bios_data) = fs::read(path) {
+            if bios_data.len() == 0x4000 {
+                println!("BIOS loaded: {} ({} bytes)", path, bios_data.len());
+                bus.load_bios(bios_data);
+                bios_loaded = true;
+                break;
+            }
+        }
+    }
+    // Also check --bios flag
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--bios" && i + 1 < args.len() {
+            let bios_data = fs::read(&args[i + 1]).unwrap_or_else(|e| {
+                eprintln!("Failed to load BIOS '{}': {}", args[i + 1], e);
+                std::process::exit(1);
+            });
+            println!("BIOS loaded: {} ({} bytes)", args[i + 1], bios_data.len());
+            bus.load_bios(bios_data);
+            bios_loaded = true;
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+
+    // Find ROM path (first non-flag argument)
+    let rom_path = args.iter().skip(1)
+        .filter(|a| *a != "--bios" && *a != "-v" && *a != "--headless" && *a != "--auto-test")
+        .filter(|a| !args.iter().any(|b| b == "--bios" && args.iter().position(|x| x == b).map(|p| args.get(p + 1)) == Some(Some(a))))
+        .next();
+
+    if let Some(rom_path) = rom_path {
         let rom_data = fs::read(rom_path).unwrap_or_else(|e| {
             eprintln!("Failed to load ROM '{}': {}", rom_path, e);
             std::process::exit(1);
         });
-        println!("Turtle GBA Emulator");
         println!("ROM loaded: {} ({} bytes)", rom_path, rom_data.len());
         bus.load_rom(rom_data);
+
+        if bios_loaded {
+            cpu.registers[R_PC] = 0x0800_0000;
+            cpu.cpsr = 0x1F;
+            cpu.registers[R_SP] = 0x0300_7F00;
+            cpu.registers[R_LR] = 0x0800_0000;
+            cpu.set_mode_sp(0x13, 0x0300_7FE0);
+            cpu.set_mode_sp(0x12, 0x0300_7FA0);
+            println!("  BIOS skip: CPU initialized to post-boot state");
+        }
     } else {
-        println!("Turtle GBA Emulator");
-        println!("No ROM specified. Usage: turtle-gba <rom_file>");
+        println!("No ROM specified. Usage: turtle-gba <rom_file> [--bios <bios.bin>]");
         println!("Running built-in test program...\n");
         bus.load_rom(make_test_rom());
     }
 
-    // Run with tracing — show each instruction as it executes
-    println!("\n--- Execution Trace ---");
-    println!("{:<10} {:<12} {:<30} Registers", "PC", "Hex", "Instruction");
-    println!("{}", "-".repeat(80));
+    let headless = args.iter().any(|a| a == "--headless");
+    let auto_test = args.iter().any(|a| a == "--auto-test");
 
-    let max_steps = 500_000; // Safety limit
+    if auto_test {
+        run_auto_test(&mut cpu, &mut bus);
+    } else if headless {
+        run_headless(&mut cpu, &mut bus, &args);
+    } else {
+        run_with_window(&mut cpu, &mut bus);
+    }
+}
+
+/// Run with a graphical window — the normal emulator mode.
+///
+/// Each iteration: execute one frame's worth of CPU cycles, then render
+/// the screen from VRAM/palette state and display it in the window.
+fn run_with_window(cpu: &mut Cpu, bus: &mut Bus) {
+    let mut window = Window::new(
+        "Turtle GBA",
+        SCREEN_WIDTH,
+        SCREEN_HEIGHT,
+        WindowOptions {
+            scale: minifb::Scale::X4, // 240×160 is tiny, scale up 4×
+            ..WindowOptions::default()
+        },
+    ).expect("Failed to create window");
+
+    // Cap at ~60 FPS (GBA runs at ~59.73 Hz)
+    window.set_target_fps(60);
+
+    let mut total_cycles: u32 = 0;
+    let mut frame_count: u64 = 0;
+
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Run multiple GBA frames per window frame for speed.
+        // We only render the LAST one so double-buffering doesn't flicker.
+        // But we poll input EVERY frame so button presses aren't missed.
+        for _ in 0..FRAMES_PER_RENDER {
+            update_keyinput(&window, bus);
+            let frame_start = total_cycles;
+            while total_cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
+                let pc = cpu.registers[R_PC];
+                let in_thumb = cpu.in_thumb_mode();
+
+                let is_halt = if in_thumb {
+                    bus.read_halfword(pc) == 0
+                } else {
+                    bus.read_word(pc) == 0
+                };
+                if is_halt {
+                    break;
+                }
+
+                cpu.step(bus);
+                bus.tick(1);
+                total_cycles = total_cycles.wrapping_add(1);
+            }
+
+            // Advance timing to frame boundary
+            while total_cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
+                bus.tick(1);
+                total_cycles = total_cycles.wrapping_add(1);
+            }
+        }
+
+        // Render and display (only the final frame state)
+        let framebuf = ppu::render_frame(&bus.vram, &bus.palette, &bus.oam, &bus.io);
+        window.update_with_buffer(&framebuf, SCREEN_WIDTH, SCREEN_HEIGHT)
+            .expect("Failed to update window");
+
+        frame_count += 1;
+        if frame_count % 60 == 0 {
+            println!("[Frame {}] PC=0x{:08X} mode={}",
+                frame_count, cpu.registers[R_PC],
+                if cpu.in_thumb_mode() { "THUMB" } else { "ARM" });
+        }
+    }
+}
+
+/// Map PC keyboard keys to GBA button bits and update KEYINPUT.
+///
+/// GBA KEYINPUT (0x04000130) is active-low: 0 = pressed, 1 = released.
+/// We start with all bits set (nothing pressed) and clear bits for held keys.
+///
+/// Mapping:
+///   Z → A        Arrow keys → D-pad
+///   X → B        Enter → Start
+///   A → L        Backspace → Select
+///   S → R
+fn update_keyinput(window: &Window, bus: &mut Bus) {
+    let key_map: &[(Key, u16)] = &[
+        (Key::Z,         1 << 0),  // A
+        (Key::X,         1 << 1),  // B
+        (Key::Backspace, 1 << 2),  // Select
+        (Key::Enter,     1 << 3),  // Start
+        (Key::Right,     1 << 4),  // Right
+        (Key::Left,      1 << 5),  // Left
+        (Key::Up,        1 << 6),  // Up
+        (Key::Down,      1 << 7),  // Down
+        (Key::S,         1 << 8),  // R shoulder
+        (Key::A,         1 << 9),  // L shoulder
+    ];
+
+    let mut keyinput: u16 = 0x03FF; // All released
+    for &(key, bit) in key_map {
+        if window.is_key_down(key) {
+            keyinput &= !bit; // Clear bit = pressed
+        }
+    }
+    bus.keyinput = keyinput;
+}
+
+/// Automated test mode: navigate through all armwrestler pages,
+/// saving a screenshot of each.
+///
+/// Armwrestler navigation: Down = move cursor, Start = select page.
+/// We simulate button presses at timed intervals to cycle through pages.
+fn run_auto_test(cpu: &mut Cpu, bus: &mut Bus) {
+    println!("\n--- Auto-Test Mode ---");
+    println!("Navigating armwrestler test pages...\n");
+
+    let wait = 60;   // Frames to wait for rendering
+    let hold = 10;   // Frames to hold a button
+
+    // Armwrestler menu items (cursor starts on first item)
+    let menu_names = [
+        "01-arm-alu",
+        "02-arm-ldr-str",
+        "03-arm-ldm-stm",
+        "04-thumb-alu",
+        "05-thumb-ldr-str",
+        "06-thumb-ldm-stm",
+    ];
+
+    // Let the menu render
+    run_frames(cpu, bus, 0x03FF, wait * 2);
+
+    for (i, name) in menu_names.iter().enumerate() {
+        // Press Start to enter this menu item
+        press_button(cpu, bus, 1 << 3, hold, wait);
+
+        // Capture the test page
+        let framebuf = ppu::render_frame(&bus.vram, &bus.palette, &bus.oam, &bus.io);
+        let filename = format!("test_{}.bmp", name);
+        save_bmp(&filename, &framebuf);
+        println!("  Saved {} (menu item {})", filename, i + 1);
+
+        // Press Select to go back to menu
+        press_button(cpu, bus, 1 << 2, hold, wait);
+
+        // Move cursor down to next item (unless last)
+        if i + 1 < menu_names.len() {
+            press_button(cpu, bus, 1 << 7, hold, wait); // Down
+        }
+    }
+
+    println!("\nDone! {} pages captured.", menu_names.len());
+}
+
+/// Press a GBA button (given as a bitmask), hold for `hold` frames, release and wait `wait` frames.
+fn press_button(cpu: &mut Cpu, bus: &mut Bus, button_bit: u16, hold: u32, wait: u32) {
+    run_frames(cpu, bus, 0x03FF & !button_bit, hold);
+    run_frames(cpu, bus, 0x03FF, wait);
+}
+
+/// Run N GBA frames with a given KEYINPUT state.
+fn run_frames(cpu: &mut Cpu, bus: &mut Bus, keyinput: u16, num_frames: u32) {
+    for _ in 0..num_frames {
+        bus.keyinput = keyinput;
+        let frame_start = bus.cycles;
+        while bus.cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
+            let pc = cpu.registers[R_PC];
+            let in_thumb = cpu.in_thumb_mode();
+            let is_halt = if in_thumb {
+                bus.read_halfword(pc) == 0
+            } else {
+                bus.read_word(pc) == 0
+            };
+            if is_halt { break; }
+
+            cpu.step(bus);
+            bus.tick(1);
+        }
+        // Advance timing to frame boundary
+        while bus.cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
+            bus.tick(1);
+        }
+    }
+}
+
+/// Save a 240×160 framebuffer as a BMP file (for debugging).
+fn save_bmp(path: &str, framebuf: &[u32]) {
+    use std::io::Write;
+    let w = SCREEN_WIDTH as u32;
+    let h = SCREEN_HEIGHT as u32;
+    let row_size = w * 3;
+    let padding = (4 - (row_size % 4)) % 4;
+    let pixel_data_size = (row_size + padding) * h;
+    let file_size = 54 + pixel_data_size;
+
+    let mut f = match fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => { eprintln!("Failed to save BMP: {}", e); return; }
+    };
+
+    // BMP header (14 bytes)
+    f.write_all(b"BM").ok();
+    f.write_all(&file_size.to_le_bytes()).ok();
+    f.write_all(&[0u8; 4]).ok(); // reserved
+    f.write_all(&54u32.to_le_bytes()).ok(); // pixel data offset
+
+    // DIB header (40 bytes)
+    f.write_all(&40u32.to_le_bytes()).ok();
+    f.write_all(&w.to_le_bytes()).ok();
+    f.write_all(&h.to_le_bytes()).ok();
+    f.write_all(&1u16.to_le_bytes()).ok(); // planes
+    f.write_all(&24u16.to_le_bytes()).ok(); // bits per pixel
+    f.write_all(&[0u8; 24]).ok(); // compression, size, resolution, colors
+
+    // Pixel data (BMP stores bottom-to-top)
+    for y in (0..h as usize).rev() {
+        for x in 0..w as usize {
+            let rgb = framebuf[y * w as usize + x];
+            let r = ((rgb >> 16) & 0xFF) as u8;
+            let g = ((rgb >> 8) & 0xFF) as u8;
+            let b = (rgb & 0xFF) as u8;
+            f.write_all(&[b, g, r]).ok(); // BMP order: BGR
+        }
+        for _ in 0..padding {
+            f.write_all(&[0]).ok();
+        }
+    }
+}
+
+/// Headless mode — run without a window (for testing/CI).
+fn run_headless(cpu: &mut Cpu, bus: &mut Bus, args: &[String]) {
+    println!("\n--- Execution Trace (headless) ---");
+
+    let max_steps = 50_000_000;
     let verbose = args.iter().any(|a| a == "-v");
     let mut last_pc = 0u32;
     let mut stuck_count = 0u32;
@@ -43,7 +333,11 @@ fn main() {
         let pc = cpu.registers[R_PC];
         let in_thumb = cpu.in_thumb_mode();
 
-        // Detect infinite loops (same PC twice in a row = stuck)
+        if step % 10_000_000 == 0 && step > 0 {
+            println!("[{}M] PC=0x{:08X} {}",
+                step / 1_000_000, pc, if in_thumb { "THUMB" } else { "ARM" });
+        }
+
         if pc == last_pc {
             stuck_count += 1;
             if stuck_count > 2 {
@@ -60,14 +354,12 @@ fn main() {
         } else {
             bus.read_word(pc) == 0
         };
-
         if is_halt {
             println!("[HALT] instruction=0 at PC=0x{:08X} after {} steps", pc, step);
             break;
         }
 
-        // Print first 20, mode switches, and periodic updates
-        let should_print = verbose || step < 20 || step % 50000 == 0;
+        let should_print = verbose || step < 20;
         if should_print {
             let desc = if in_thumb {
                 format!("T:{:04X}", bus.read_halfword(pc))
@@ -75,25 +367,12 @@ fn main() {
                 let inst = bus.read_word(pc);
                 disassemble_arm(inst)
             };
-            print!("{:>6} 0x{:08X}  {:<28}", step, pc, desc);
+            println!("{:>6} 0x{:08X}  {:<28} R0=0x{:08X} R1=0x{:08X} CPSR=0x{:08X}",
+                step, pc, desc, cpu.registers[0], cpu.registers[1], cpu.cpsr);
         }
 
-        let should_continue = cpu.step(&mut bus);
-
-        if should_print {
-            let mode_switch = in_thumb != cpu.in_thumb_mode();
-            println!("R0=0x{:08X} R1=0x{:08X}{}",
-                cpu.registers[0], cpu.registers[1],
-                if mode_switch { "  [MODE SWITCH]" } else { "" });
-        } else if in_thumb != cpu.in_thumb_mode() {
-            println!("{:>6} 0x{:08X}  [MODE SWITCH → {}]",
-                step, pc, if cpu.in_thumb_mode() { "THUMB" } else { "ARM" });
-        }
-
-        if !should_continue {
-            println!("[HALT] CPU halted after {} steps", step + 1);
-            break;
-        }
+        cpu.step(bus);
+        bus.tick(1);
 
         if step == max_steps - 1 {
             println!("\n[LIMIT] Stopped after {} steps (safety limit)", max_steps);
@@ -119,74 +398,45 @@ fn main() {
         cpu.cpsr,
         cpu.flag_n() as u8, cpu.flag_z() as u8,
         cpu.flag_c() as u8, cpu.flag_v() as u8);
+
+    // Dump both VRAM frame buffers as images
+    let dispcnt = (bus.io[0] as u16) | ((bus.io[1] as u16) << 8);
+    println!("\n--- Display State ---");
+    println!("  DISPCNT: 0x{:04X} (mode={})", dispcnt, dispcnt & 7);
+
+    // Save a snapshot of the display state
+    let dispcnt = (bus.io[0] as u16) | ((bus.io[1] as u16) << 8);
+    println!("\n--- Display State ---");
+    println!("  DISPCNT: 0x{:04X} (mode={})", dispcnt, dispcnt & 7);
+    let framebuf = ppu::render_frame(&bus.vram, &bus.palette, &bus.oam, &bus.io);
+    save_bmp("headless.bmp", &framebuf);
+    println!("  Saved headless.bmp");
 }
 
 /// Build a minimal test ROM by hand.
-/// This teaches how a GBA ROM is structured at the byte level.
 fn make_test_rom() -> Vec<u8> {
-    // Our test program (ARM assembly → machine code):
-    //
-    //   ; --- Simple counting program ---
-    //   ; Counts from 1 to 10, storing sum in R2
-    //
-    //   entry:
-    //     B start          ; Branch past the header (offset = 0x0C0 - 8) / 4
-    //     ; ... 192 bytes of header (we fill with zeros, no BIOS check) ...
-    //
-    //   start:             ; at ROM offset 0x0C0
-    //     MOV R0, #0       ; R0 = counter (starts at 0)
-    //     MOV R1, #10      ; R1 = limit
-    //     MOV R2, #0       ; R2 = sum
-    //
-    //   loop:
-    //     ADD R0, R0, #1   ; counter++
-    //     ADD R2, R2, R0   ; sum += counter
-    //     CMP R0, R1       ; compare counter to limit
-    //     BNE loop         ; if not equal, loop back
-    //
-    //     ; At this point: R0=10, R2=55 (1+2+3+...+10)
-    //
-    //     ; Store the result to IWRAM so we can verify memory works
-    //     MOV R3, #0x03    ;
-    //     MOV R3, R3, LSL #24 ; R3 = 0x03000000 (IWRAM base)
-    //     STR R2, [R3]     ; Store sum at IWRAM[0]
-    //
-    //     ; Halt (instruction = 0)
+    let mut rom = vec![0u8; 0x100];
 
-    let mut rom = vec![0u8; 0x100]; // Start with 256 bytes of zeros (header space)
-
-    // --- Offset 0x000: Entry branch ---
-    // B start: branch to offset 0x0C0
-    // The branch offset is: (target - instruction_addr - 8) / 4
-    //   instruction_addr = 0x000
-    //   target = 0x0C0
-    //   offset = (0x0C0 - 0x000 - 8) / 4 = 0xB8 / 4 = 0x2E
-    // Encoding: 0xEA00002E
     write_word(&mut rom, 0x000, 0xEA00_002E); // B to offset 0x0C0
 
-    // --- Offset 0x0A0: Game title ---
     let title = b"TURTLE TEST\0";
     rom[0x0A0..0x0A0 + title.len()].copy_from_slice(title);
 
-    // --- Offset 0x0C0: Program start ---
     let code_start = 0x0C0;
     let instructions: Vec<u32> = vec![
-        0xE3A0_0000, // MOV R0, #0       ; counter = 0
-        0xE3A0_100A, // MOV R1, #10      ; limit = 10
-        0xE3A0_2000, // MOV R2, #0       ; sum = 0
-        // loop:
-        0xE280_0001, // ADD R0, R0, #1   ; counter++
-        0xE082_2000, // ADD R2, R2, R0   ; sum += counter
-        0xE150_0001, // CMP R0, R1       ; counter == limit?
-        0x1AFF_FFFB, // BNE loop         ; offset=-5: (0x0CC - 0x0D8 - 8) / 4
-        // After loop: R0=10, R2=55
+        0xE3A0_0000, // MOV R0, #0
+        0xE3A0_100A, // MOV R1, #10
+        0xE3A0_2000, // MOV R2, #0
+        0xE280_0001, // ADD R0, R0, #1
+        0xE082_2000, // ADD R2, R2, R0
+        0xE150_0001, // CMP R0, R1
+        0x1AFF_FFFB, // BNE loop
         0xE3A0_3003, // MOV R3, #3
-        0xE1A0_3C03, // MOV R3, R3, LSL #24  ; R3 = 0x03000000
-        0xE583_2000, // STR R2, [R3]     ; IWRAM[0] = 55
+        0xE1A0_3C03, // MOV R3, R3, LSL #24
+        0xE583_2000, // STR R2, [R3]
         0x0000_0000, // HALT
     ];
 
-    // Make sure ROM is big enough
     let needed = code_start + instructions.len() * 4 + 16;
     if rom.len() < needed {
         rom.resize(needed, 0);
@@ -218,7 +468,6 @@ fn disassemble_arm(instruction: u32) -> String {
 
     match bits_27_26 {
         0b00 => {
-            // Data processing
             let is_imm = (instruction >> 25) & 1 == 1;
             let opcode = (instruction >> 21) & 0xF;
             let s = if (instruction >> 20) & 1 == 1 { "S" } else { "" };
@@ -269,7 +518,6 @@ fn disassemble_arm(instruction: u32) -> String {
             }
         }
         0b01 => {
-            // LDR/STR
             let is_load = (instruction >> 20) & 1 == 1;
             let rn = (instruction >> 16) & 0xF;
             let rd = (instruction >> 12) & 0xF;

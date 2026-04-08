@@ -3,33 +3,81 @@
 /// The real chip runs at 16.78 MHz (about 16 million instructions per second).
 /// We model its state as registers + a reference to memory.
 
-/// The CPU has different operating modes (e.g., normal, interrupt handling).
-/// Each mode has its own banked copies of some registers.
-/// For now, we start with just "System" mode — the normal one.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CpuMode {
-    System,
-    // We'll add more modes later: FIQ, IRQ, Supervisor, Abort, Undefined
+/// ARM7TDMI processor modes, identified by bits 4-0 of CPSR.
+///
+/// Each mode has its own banked copies of certain registers:
+/// - All modes bank R13 (SP) and R14 (LR)
+/// - FIQ additionally banks R8-R12 (for fast interrupt response)
+/// - Each non-User/System mode has its own SPSR (Saved Program Status Register)
+///
+/// Mode bits:
+///   0x10 = User       — normal program execution
+///   0x11 = FIQ        — fast interrupt (extra banked regs for speed)
+///   0x12 = IRQ        — normal interrupt
+///   0x13 = Supervisor — entered via SWI (BIOS calls)
+///   0x17 = Abort      — memory access violation
+///   0x1B = Undefined  — undefined instruction trap
+///   0x1F = System     — privileged User mode (shares User's banked regs)
+
+/// Index into banked register arrays. We store one set per privileged mode.
+/// User and System share the same bank (index 0).
+const BANK_USR: usize = 0; // User/System
+const BANK_FIQ: usize = 1;
+const BANK_IRQ: usize = 2;
+const BANK_SVC: usize = 3; // Supervisor
+const BANK_ABT: usize = 4; // Abort
+const BANK_UND: usize = 5; // Undefined
+const NUM_BANKS: usize = 6;
+
+/// Map CPSR mode bits to a bank index
+fn mode_to_bank(mode_bits: u32) -> usize {
+    match mode_bits & 0x1F {
+        0x10 | 0x1F => BANK_USR, // User and System share banks
+        0x11 => BANK_FIQ,
+        0x12 => BANK_IRQ,
+        0x13 => BANK_SVC,
+        0x17 => BANK_ABT,
+        0x1B => BANK_UND,
+        _ => BANK_USR, // Fallback for invalid mode bits
+    }
 }
 
-/// The CPU state: 16 registers + status register.
+/// The CPU state: 16 registers + status register + banked registers.
+///
+/// The ARM7TDMI has 37 total registers:
+///   - 16 "current" registers (R0-R15)
+///   - 10 banked copies of R13/R14 (one pair per non-User mode)
+///   - 5 banked R8-R12 for FIQ mode
+///   - 5 SPSRs (one per non-User/System mode)
+///   - 1 CPSR
 pub struct Cpu {
     /// R0 through R15. Index 15 is the Program Counter (PC).
-    /// Each register is 32 bits — that's what "32-bit CPU" means.
-    /// u32 in Rust is an unsigned 32-bit integer: 0 to 4,294,967,295.
+    /// R13 and R14 are swapped in/out when the CPU changes mode.
     pub registers: [u32; 16],
 
     /// Current Program Status Register.
-    /// Bit 31: N (Negative)
-    /// Bit 30: Z (Zero)
-    /// Bit 29: C (Carry)
-    /// Bit 28: V (Overflow)
-    /// Bits 4-0: Mode bits (which CPU mode we're in)
-    /// We store the whole thing as a u32 and use bit manipulation to read flags.
+    /// Bit 31: N (Negative)  Bit 30: Z (Zero)
+    /// Bit 29: C (Carry)     Bit 28: V (Overflow)
+    /// Bit 5: T (Thumb)      Bits 4-0: Mode
     pub cpsr: u32,
 
-    /// Current operating mode
-    pub mode: CpuMode,
+    /// Banked R13 (SP) for each mode — swapped when mode changes
+    banked_sp: [u32; NUM_BANKS],
+
+    /// Banked R14 (LR) for each mode — swapped when mode changes
+    banked_lr: [u32; NUM_BANKS],
+
+    /// Banked R8-R12 for FIQ mode (all other modes share the main set)
+    banked_fiq_r8_r12: [u32; 5],
+
+    /// Saved copies of R8-R12 from non-FIQ mode (restored when leaving FIQ)
+    banked_usr_r8_r12: [u32; 5],
+
+    /// Saved Program Status Registers — one per privileged mode.
+    /// When an exception occurs, the current CPSR is saved to the new mode's SPSR.
+    /// SPSR[0] (User/System) is unused since those modes can't have a saved status.
+    pub spsr: [u32; NUM_BANKS],
+
 }
 
 // Named indices for clarity — so we write R_PC instead of magic number 15.
@@ -52,7 +100,11 @@ impl Cpu {
         let mut cpu = Cpu {
             registers: [0; 16],
             cpsr: 0,
-            mode: CpuMode::System,
+            banked_sp: [0; NUM_BANKS],
+            banked_lr: [0; NUM_BANKS],
+            banked_fiq_r8_r12: [0; 5],
+            banked_usr_r8_r12: [0; 5],
+            spsr: [0; NUM_BANKS],
         };
 
         // The PC starts at the beginning of ROM
@@ -60,8 +112,62 @@ impl Cpu {
 
         // The stack pointer is conventionally initialized to the top of IWRAM
         cpu.registers[R_SP] = 0x0300_7F00;
+        cpu.banked_sp[BANK_USR] = 0x0300_7F00;
 
         cpu
+    }
+
+    /// Set the banked SP for a given mode (used during BIOS skip initialization).
+    pub fn set_mode_sp(&mut self, mode_bits: u32, sp: u32) {
+        let bank = mode_to_bank(mode_bits);
+        self.banked_sp[bank] = sp;
+    }
+
+    /// Switch banked registers when the CPU mode changes.
+    ///
+    /// On real hardware this happens automatically in the same cycle as the
+    /// mode change. We save the current mode's SP/LR into their bank, then
+    /// load the new mode's SP/LR from their bank.
+    fn switch_mode(&mut self, old_mode: u32, new_mode: u32) {
+        let old_bank = mode_to_bank(old_mode);
+        let new_bank = mode_to_bank(new_mode);
+
+        if old_bank == new_bank {
+            return; // Same bank (e.g., User ↔ System), nothing to swap
+        }
+
+        // Save current R13/R14 to old bank
+        self.banked_sp[old_bank] = self.registers[R_SP];
+        self.banked_lr[old_bank] = self.registers[R_LR];
+
+        // FIQ banks R8-R12 as well
+        if old_bank == BANK_FIQ {
+            for i in 0..5 {
+                self.banked_fiq_r8_r12[i] = self.registers[8 + i];
+                self.registers[8 + i] = self.banked_usr_r8_r12[i];
+            }
+        } else if new_bank == BANK_FIQ {
+            for i in 0..5 {
+                self.banked_usr_r8_r12[i] = self.registers[8 + i];
+                self.registers[8 + i] = self.banked_fiq_r8_r12[i];
+            }
+        }
+
+        // Load R13/R14 from new bank
+        self.registers[R_SP] = self.banked_sp[new_bank];
+        self.registers[R_LR] = self.banked_lr[new_bank];
+    }
+
+    /// Write to CPSR with automatic bank switching when mode bits change.
+    /// `mask` controls which fields are written (e.g., flags only vs full CPSR).
+    fn write_cpsr(&mut self, value: u32, mask: u32) {
+        let old_mode = self.cpsr & 0x1F;
+        self.cpsr = (self.cpsr & !mask) | (value & mask);
+        let new_mode = self.cpsr & 0x1F;
+
+        if old_mode != new_mode {
+            self.switch_mode(old_mode, new_mode);
+        }
     }
 
     // --- Flag helpers ---
@@ -111,17 +217,40 @@ impl Cpu {
     /// Returns (shifted_value, carry_out).
     /// `shift_type`: 0=LSL, 1=LSR, 2=ASR, 3=ROR
     /// `amount`: how many bits to shift (0-31 for immediate, 0-255 for register)
-    fn barrel_shift(&self, value: u32, shift_type: u32, amount: u32) -> (u32, bool) {
-        let carry_in = self.flag_c(); // Current carry flag as default
+    /// Barrel shifter — shifts/rotates a value and produces a carry-out.
+    ///
+    /// `is_immediate_shift` distinguishes between:
+    ///   - Immediate shift (5-bit amount encoded in instruction): amount=0 has special meanings
+    ///   - Register shift (amount from Rs): amount=0 means "don't shift"
+    fn barrel_shift_ext(&self, value: u32, shift_type: u32, amount: u32, is_immediate_shift: bool) -> (u32, bool) {
+        let carry_in = self.flag_c();
 
+        // For register shifts, amount=0 always means "no shift, carry unchanged"
+        // For immediate shifts, amount=0 has special encodings per shift type
         if amount == 0 {
-            // Shift by 0 is a special case for each type:
-            // LSL #0: no change, carry unchanged
-            // LSR #0: actually means LSR #32 (value becomes 0, carry = bit 31)
-            // ASR #0: actually means ASR #32 (all bits become sign bit)
-            // ROR #0: actually means RRX (rotate right by 1 through carry)
-            // But when encoded as immediate shift of 0, LSL #0 = identity
-            return (value, carry_in);
+            if !is_immediate_shift || shift_type == 0 {
+                // LSL #0 or register-shift by 0: identity, carry unchanged
+                return (value, carry_in);
+            }
+            // Immediate shift of 0 with non-LSL types has special meaning:
+            return match shift_type {
+                1 => {
+                    // LSR #0 encodes LSR #32: result=0, carry=bit 31
+                    (0, (value >> 31) & 1 != 0)
+                }
+                2 => {
+                    // ASR #0 encodes ASR #32: all bits become sign bit
+                    let sign = (value as i32) >> 31;
+                    (sign as u32, (value >> 31) & 1 != 0)
+                }
+                3 => {
+                    // ROR #0 encodes RRX: rotate right by 1 through carry
+                    let carry = value & 1 != 0;
+                    let result = (value >> 1) | ((carry_in as u32) << 31);
+                    (result, carry)
+                }
+                _ => unreachable!(),
+            };
         }
 
         match shift_type {
@@ -145,33 +274,29 @@ impl Cpu {
             }
             2 => { // ASR — Arithmetic Shift Right (preserves sign)
                 if amount >= 32 {
-                    // All bits become the sign bit
                     let sign = (value as i32) >> 31;
                     (sign as u32, (value >> 31) & 1 != 0)
                 } else {
                     let carry = (value >> (amount - 1)) & 1 != 0;
-                    // Cast to i32 so >> preserves the sign bit (arithmetic shift)
                     ((value as i32 >> amount) as u32, carry)
                 }
             }
             3 => { // ROR — Rotate Right
+                let amount = amount % 32;
                 if amount == 0 {
-                    // RRX: rotate right by 1 through carry
-                    let carry = value & 1 != 0;
-                    let result = (value >> 1) | ((carry_in as u32) << 31);
-                    (result, carry)
+                    (value, (value >> 31) & 1 != 0)
                 } else {
-                    let amount = amount % 32;
-                    if amount == 0 {
-                        (value, (value >> 31) & 1 != 0)
-                    } else {
-                        let carry = (value >> (amount - 1)) & 1 != 0;
-                        (value.rotate_right(amount), carry)
-                    }
+                    let carry = (value >> (amount - 1)) & 1 != 0;
+                    (value.rotate_right(amount), carry)
                 }
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Convenience wrapper used by existing code (assumes immediate shift encoding)
+    fn barrel_shift(&self, value: u32, shift_type: u32, amount: u32) -> (u32, bool) {
+        self.barrel_shift_ext(value, shift_type, amount, true)
     }
 
     /// Decode operand2 for data processing instructions.
@@ -191,21 +316,31 @@ impl Cpu {
         } else {
             // Register with optional shift
             let rm = (instruction & 0xF) as usize;
-            let rm_val = self.read_reg(rm);
-
             let shift_type = (instruction >> 5) & 0x3;
             let shift_by_reg = (instruction >> 4) & 1 == 1;
 
-            let amount = if shift_by_reg {
-                // Shift amount from register (Rs), using bottom byte only
-                let rs = ((instruction >> 8) & 0xF) as usize;
-                self.read_reg(rs) & 0xFF
+            // When operand2 uses a register-specified shift (bit 4=1),
+            // the ARM7TDMI takes an extra internal cycle. If Rm is PC,
+            // this means PC has advanced one more step: reads as
+            // instruction_addr + 12 instead of the usual +8.
+            let rm_val = if shift_by_reg && rm == R_PC {
+                self.read_reg(rm).wrapping_add(4)
             } else {
-                // Shift amount is a 5-bit immediate
-                (instruction >> 7) & 0x1F
+                self.read_reg(rm)
             };
 
-            self.barrel_shift(rm_val, shift_type, amount)
+            if shift_by_reg {
+                // Shift amount from register (Rs), using bottom byte only
+                let rs = ((instruction >> 8) & 0xF) as usize;
+                let amount = self.read_reg(rs) & 0xFF;
+                // Register-specified shift: amount=0 means "no shift"
+                self.barrel_shift_ext(rm_val, shift_type, amount, false)
+            } else {
+                // Shift amount is a 5-bit immediate
+                let amount = (instruction >> 7) & 0x1F;
+                // Immediate shift: amount=0 has special encodings (LSR#32, ASR#32, RRX)
+                self.barrel_shift_ext(rm_val, shift_type, amount, true)
+            }
         }
     }
 
@@ -269,6 +404,11 @@ impl Cpu {
     /// Execute one CPU step: fetch an instruction, decode it, execute it.
     /// Returns true if execution should continue, false to halt.
     pub fn step(&mut self, bus: &mut crate::bus::Bus) -> bool {
+        // Check for pending IRQ: CPSR I-bit must be clear (IRQs enabled)
+        if self.cpsr & 0x80 == 0 && bus.irq_pending() {
+            self.enter_irq();
+        }
+
         if self.in_thumb_mode() {
             return self.step_thumb(bus);
         }
@@ -383,7 +523,13 @@ impl Cpu {
             if field_mask & 0x8 != 0 { mask |= 0xFF00_0000; } // Flags field (N,Z,C,V)
             if field_mask & 0x1 != 0 { mask |= 0x0000_00FF; } // Control field (mode, T, etc.)
 
-            self.cpsr = (self.cpsr & !mask) | (value & mask);
+            let is_spsr = (instruction >> 22) & 1 == 1;
+            if is_spsr {
+                let bank = mode_to_bank(self.cpsr & 0x1F);
+                self.spsr[bank] = (self.spsr[bank] & !mask) | (value & mask);
+            } else {
+                self.write_cpsr(value, mask);
+            }
             return true;
         }
 
@@ -391,7 +537,13 @@ impl Cpu {
         // Pattern: xxxx 0001 0x00 1111 xxxx 0000 0000 0000
         if instruction & 0x0FBF_0FFF == 0x010F_0000 {
             let rd = ((instruction >> 12) & 0xF) as usize;
-            self.registers[rd] = self.cpsr;
+            let is_spsr = (instruction >> 22) & 1 == 1;
+            if is_spsr {
+                let bank = mode_to_bank(self.cpsr & 0x1F);
+                self.registers[rd] = self.spsr[bank];
+            } else {
+                self.registers[rd] = self.cpsr;
+            }
             return true;
         }
 
@@ -546,12 +698,14 @@ impl Cpu {
                 if top5 & 0x1E == 0b11000 {
                     // Format 15: Multiple load/store (LDMIA/STMIA)
                     self.thumb_multiple_load_store(instruction, bus);
-                } else if top5 == 0b11011 || top5 == 0b11010 {
-                    // Format 16: Conditional branch
-                    self.thumb_conditional_branch(instruction);
                 } else if top8 == 0b11011111 {
                     // Format 17: SWI (Software Interrupt)
+                    // Must check BEFORE Format 16 — SWI (0xDF__) shares top5=0b11011
+                    // with conditional branches, but uses condition field 0xF
                     self.execute_swi_thumb(instruction, bus);
+                } else if top5 == 0b11011 || top5 == 0b11010 {
+                    // Format 16: Conditional branch (conditions 0x0-0xE)
+                    self.thumb_conditional_branch(instruction);
                 }
             }
             0b111 => {
@@ -676,9 +830,9 @@ impl Cpu {
         let result = match op {
             0x0 => a & b,                                         // AND
             0x1 => a ^ b,                                         // EOR
-            0x2 => { let (r, c) = self.barrel_shift(a, 0, b & 0xFF); self.set_flag(CPSR_C, c); r } // LSL
-            0x3 => { let (r, c) = self.barrel_shift(a, 1, b & 0xFF); self.set_flag(CPSR_C, c); r } // LSR
-            0x4 => { let (r, c) = self.barrel_shift(a, 2, b & 0xFF); self.set_flag(CPSR_C, c); r } // ASR
+            0x2 => { let (r, c) = self.barrel_shift_ext(a, 0, b & 0xFF, false); self.set_flag(CPSR_C, c); r } // LSL
+            0x3 => { let (r, c) = self.barrel_shift_ext(a, 1, b & 0xFF, false); self.set_flag(CPSR_C, c); r } // LSR
+            0x4 => { let (r, c) = self.barrel_shift_ext(a, 2, b & 0xFF, false); self.set_flag(CPSR_C, c); r } // ASR
             0x5 => { // ADC
                 let c = if self.flag_c() { 1u32 } else { 0 };
                 let r = a.wrapping_add(b).wrapping_add(c);
@@ -693,7 +847,7 @@ impl Cpu {
                 self.set_flag(CPSR_V, ((a ^ b) & (a ^ r) & 0x8000_0000) != 0);
                 r
             }
-            0x7 => { let (r, c) = self.barrel_shift(a, 3, b & 0xFF); self.set_flag(CPSR_C, c); r } // ROR
+            0x7 => { let (r, c) = self.barrel_shift_ext(a, 3, b & 0xFF, false); self.set_flag(CPSR_C, c); r } // ROR
             0x8 => { a & b } // TST (don't store)
             0x9 => { // NEG: Rd = 0 - Rs
                 let r = 0u32.wrapping_sub(b);
@@ -714,7 +868,10 @@ impl Cpu {
                 r
             }
             0xC => a | b,                                          // ORR
-            0xD => a.wrapping_mul(b),                              // MUL
+            0xD => {                                                  // MUL
+                self.set_flag(CPSR_C, false); // C destroyed (set to 0)
+                a.wrapping_mul(b)
+            }
             0xE => a & !b,                                         // BIC
             0xF => !b,                                             // MVN
             _ => unreachable!(),
@@ -742,7 +899,12 @@ impl Cpu {
         match op {
             0 => { // ADD
                 let rd_val = self.read_reg(rd);
-                self.registers[rd] = rd_val.wrapping_add(rs_val);
+                let result = rd_val.wrapping_add(rs_val);
+                if rd == R_PC {
+                    self.registers[R_PC] = result & !1;
+                } else {
+                    self.registers[rd] = result;
+                }
             }
             1 => { // CMP
                 let rd_val = self.read_reg(rd);
@@ -753,7 +915,12 @@ impl Cpu {
                 self.set_flag(CPSR_V, ((rd_val ^ rs_val) & (rd_val ^ result) & 0x8000_0000) != 0);
             }
             2 => { // MOV
-                self.registers[rd] = rs_val;
+                if rd == R_PC {
+                    // MOV PC, Rs — branch (halfword-align on ARM7TDMI)
+                    self.registers[R_PC] = rs_val & !1;
+                } else {
+                    self.registers[rd] = rs_val;
+                }
             }
             3 => { // BX
                 if rs_val & 1 != 0 {
@@ -805,13 +972,17 @@ impl Cpu {
                 self.registers[rd] = if is_byte {
                     bus.read_byte(addr) as u32
                 } else {
-                    bus.read_word(addr)
+                    // LDR: unaligned → force-align and rotate (same as ARM)
+                    let misalign = addr & 3;
+                    let aligned = addr & !3;
+                    let val = bus.read_word(aligned);
+                    if misalign != 0 { val.rotate_right(misalign * 8) } else { val }
                 };
             } else {
                 if is_byte {
                     bus.write_byte(addr, self.registers[rd] as u8);
                 } else {
-                    bus.write_word(addr, self.registers[rd]);
+                    bus.write_word(addr & !3, self.registers[rd]);
                 }
             }
         }
@@ -832,13 +1003,17 @@ impl Cpu {
             self.registers[rd] = if is_byte {
                 bus.read_byte(addr) as u32
             } else {
-                bus.read_word(addr)
+                // LDR: unaligned → force-align and rotate
+                let misalign = addr & 3;
+                let aligned = addr & !3;
+                let val = bus.read_word(aligned);
+                if misalign != 0 { val.rotate_right(misalign * 8) } else { val }
             };
         } else {
             if is_byte {
                 bus.write_byte(addr, self.registers[rd] as u8);
             } else {
-                bus.write_word(addr, self.registers[rd]);
+                bus.write_word(addr & !3, self.registers[rd]);
             }
         }
     }
@@ -1013,7 +1188,8 @@ impl Cpu {
         } else {
             // Second instruction: jump and link
             let target = self.registers[R_LR].wrapping_add(offset << 1);
-            self.registers[R_LR] = (self.registers[R_PC].wrapping_sub(2)) | 1; // Return addr with THUMB bit
+            // LR = address of next instruction (after this 2-byte instruction) with THUMB bit set
+            self.registers[R_LR] = self.registers[R_PC] | 1;
             self.registers[R_PC] = target & !1;
         }
     }
@@ -1077,43 +1253,70 @@ impl Cpu {
         }
 
         // Update flags if S bit is set
-        if set_flags {
+        if set_flags && rd == R_PC && !is_test_op {
+            // Special case: S=1 and Rd=PC means "copy SPSR to CPSR" (exception return)
+            let bank = mode_to_bank(self.cpsr & 0x1F);
+            self.write_cpsr(self.spsr[bank], 0xFFFF_FFFF);
+        } else if set_flags {
             self.set_flag(CPSR_Z, result == 0);
             self.set_flag(CPSR_N, (result >> 31) & 1 == 1);
 
-            // Carry flag depends on the operation type:
+            // Carry and overflow flags depend on the operation type.
+            // For arithmetic ops, we compute the "true" 64-bit or borrow result.
+            // For logical ops, carry comes from the barrel shifter, V is unchanged.
             match opcode {
-                // Arithmetic ops: carry from the ALU
-                0x2 | 0x3 | 0x6 | 0x7 | 0xA => {
-                    // SUB/RSB/SBC/RSC/CMP: carry = no borrow
+                0x2 | 0xA => {
+                    // SUB/CMP: result = op1 - op2
+                    // Carry = no borrow = op1 >= op2
                     self.set_flag(CPSR_C, op1 >= op2);
+                    let overflow = ((op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0;
+                    self.set_flag(CPSR_V, overflow);
                 }
-                0x4 | 0x5 | 0xB => {
-                    // ADD/ADC/CMN: carry = unsigned overflow
-                    self.set_flag(CPSR_C, (op1 as u64 + op2 as u64) > 0xFFFF_FFFF);
+                0x3 => {
+                    // RSB: result = op2 - op1 (reversed operands)
+                    self.set_flag(CPSR_C, op2 >= op1);
+                    let overflow = ((op2 ^ op1) & (op2 ^ result) & 0x8000_0000) != 0;
+                    self.set_flag(CPSR_V, overflow);
                 }
-                // Logical ops: carry from the barrel shifter
+                0x4 | 0xB => {
+                    // ADD/CMN: carry = unsigned overflow
+                    let wide = op1 as u64 + op2 as u64;
+                    self.set_flag(CPSR_C, wide > 0xFFFF_FFFF);
+                    let overflow = (!(op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0;
+                    self.set_flag(CPSR_V, overflow);
+                }
+                0x5 => {
+                    // ADC: result = op1 + op2 + C
+                    let c = if self.flag_c() { 1u64 } else { 0 };
+                    let wide = op1 as u64 + op2 as u64 + c;
+                    self.set_flag(CPSR_C, wide > 0xFFFF_FFFF);
+                    let overflow = (!(op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0;
+                    self.set_flag(CPSR_V, overflow);
+                }
+                0x6 => {
+                    // SBC: result = op1 - op2 + C - 1 = op1 - op2 - !C
+                    let c = if self.flag_c() { 1u64 } else { 0 };
+                    let wide = op1 as u64 + (!op2) as u64 + c;
+                    self.set_flag(CPSR_C, wide > 0xFFFF_FFFF);
+                    // For SBC overflow: treat as op1 - (op2 + !C)
+                    let overflow = ((op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0;
+                    self.set_flag(CPSR_V, overflow);
+                }
+                0x7 => {
+                    // RSC: result = op2 - op1 + C - 1 = op2 - op1 - !C
+                    let c = if self.flag_c() { 1u64 } else { 0 };
+                    let wide = op2 as u64 + (!op1) as u64 + c;
+                    self.set_flag(CPSR_C, wide > 0xFFFF_FFFF);
+                    let overflow = ((op2 ^ op1) & (op2 ^ result) & 0x8000_0000) != 0;
+                    self.set_flag(CPSR_V, overflow);
+                }
+                // Logical ops: carry from barrel shifter, V unchanged
                 0x0 | 0x1 | 0x8 | 0x9 | 0xC | 0xD | 0xE | 0xF => {
                     self.set_flag(CPSR_C, shift_carry);
                 }
                 _ => {}
             }
-
-            // Overflow flag for arithmetic ops (signed overflow)
-            match opcode {
-                0x2 | 0x3 | 0xA => {
-                    // SUB/RSB/CMP: overflow if signs differ and result sign != expected
-                    let overflow = ((op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0;
-                    self.set_flag(CPSR_V, overflow);
-                }
-                0x4 | 0xB => {
-                    // ADD/CMN: overflow if same-sign inputs produce different-sign result
-                    let overflow = (!(op1 ^ op2) & (op1 ^ result) & 0x8000_0000) != 0;
-                    self.set_flag(CPSR_V, overflow);
-                }
-                _ => {} // Logical ops don't affect V
-            }
-        }
+        } // end else if set_flags
     }
 
     // --- Branch ---
@@ -1162,11 +1365,14 @@ impl Cpu {
 
     fn execute_single_transfer(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
         let is_load = (instruction >> 20) & 1 == 1;
+        let write_back = (instruction >> 21) & 1 == 1; // W bit: write-back for pre-indexed
+        let is_byte = (instruction >> 22) & 1 == 1; // B bit: 1=byte, 0=word
         let add_offset = (instruction >> 23) & 1 == 1;
         let pre_index = (instruction >> 24) & 1 == 1;
         let is_immediate = (instruction >> 25) & 1 == 0; // Note: inverted from data processing!
         let rn = ((instruction >> 16) & 0xF) as usize;
         let rd = ((instruction >> 12) & 0xF) as usize;
+
 
         let offset = if is_immediate {
             instruction & 0xFFF // 12-bit immediate offset
@@ -1188,15 +1394,34 @@ impl Cpu {
 
         let effective_addr = if pre_index { addr } else { base };
 
+
         if is_load {
-            self.registers[rd] = bus.read_word(effective_addr);
+            self.registers[rd] = if is_byte {
+                bus.read_byte(effective_addr) as u32
+            } else {
+                // ARM7TDMI LDR: unaligned address → force-align, then rotate right
+                let misalign = effective_addr & 3;
+                let aligned = effective_addr & !3;
+                let val = bus.read_word(aligned);
+                if misalign != 0 {
+                    val.rotate_right(misalign * 8)
+                } else {
+                    val
+                }
+            };
         } else {
-            let value = self.registers[rd];
-            bus.write_word(effective_addr, value);
+            if is_byte {
+                bus.write_byte(effective_addr, self.registers[rd] as u8);
+            } else {
+                // STR: force-align address
+                bus.write_word(effective_addr & !3, self.registers[rd]);
+            }
         }
 
-        // Post-index: update base register after the transfer
-        if !pre_index {
+        // Write-back: update base register with the offset address.
+        // Post-index always writes back. Pre-index only if W bit is set.
+        // For loads: if Rd == Rn, the loaded value takes priority (skip write-back).
+        if (!pre_index || write_back) && !(is_load && rd == rn) {
             self.registers[rn] = addr;
         }
     }
@@ -1220,56 +1445,78 @@ impl Cpu {
     fn execute_block_transfer(&mut self, instruction: u32, bus: &mut crate::bus::Bus) {
         let pre = (instruction >> 24) & 1 == 1;
         let up = (instruction >> 23) & 1 == 1;
+        let s_bit = (instruction >> 22) & 1 == 1;
         let write_back = (instruction >> 21) & 1 == 1;
         let is_load = (instruction >> 20) & 1 == 1;
         let rn = ((instruction >> 16) & 0xF) as usize;
         let reg_list = instruction & 0xFFFF;
+        let has_pc = reg_list & (1 << 15) != 0;
 
-        let mut addr = self.registers[rn];
-
-        // Count registers to transfer
+        let base = self.registers[rn];
         let count = reg_list.count_ones();
 
-        // For descending (down), we start from base - count * 4
-        if !up {
-            addr = addr.wrapping_sub(count * 4);
-            if write_back {
-                self.registers[rn] = addr;
-            }
-            // When going down, we still store low-to-high in memory
-            // So we just changed the start address; now process upward
-            for i in 0..16u32 {
-                if reg_list & (1 << i) != 0 {
-                    let ea = if pre { addr.wrapping_add(4) } else { addr };
-                    if is_load {
-                        self.registers[i as usize] = bus.read_word(ea);
-                    } else {
-                        bus.write_word(ea, self.registers[i as usize]);
-                    }
-                    addr = addr.wrapping_add(4);
+        // Determine the lowest memory address for the transfer.
+        // ARM always stores registers low-to-high in memory regardless of direction.
+        //
+        //   STMIA/LDMIA (P=0, U=1): lowest = base
+        //   STMIB/LDMIB (P=1, U=1): lowest = base + 4
+        //   STMDA/LDMDA (P=0, U=0): lowest = base - (count-1)*4
+        //   STMDB/LDMDB (P=1, U=0): lowest = base - count*4
+        let start_addr = match (pre, up) {
+            (false, true)  => base,                                  // IA
+            (true,  true)  => base.wrapping_add(4),                  // IB
+            (false, false) => base.wrapping_sub((count - 1) * 4),   // DA
+            (true,  false) => base.wrapping_sub(count * 4),          // DB
+        };
+
+        // S bit with PC NOT in list: access user-mode registers.
+        // Temporarily swap to user bank for the transfer, then swap back.
+        let current_mode = self.cpsr & 0x1F;
+        let use_user_bank = s_bit && !has_pc;
+        if use_user_bank && current_mode != 0x10 && current_mode != 0x1F {
+            self.switch_mode(current_mode, 0x10);
+        }
+
+        // Transfer registers from lowest address upward
+        let mut addr = start_addr;
+        for i in 0..16u32 {
+            if reg_list & (1 << i) != 0 {
+                if is_load {
+                    self.registers[i as usize] = bus.read_word(addr);
+                } else {
+                    bus.write_word(addr, self.registers[i as usize]);
                 }
-            }
-        } else {
-            // Ascending (up)
-            for i in 0..16u32 {
-                if reg_list & (1 << i) != 0 {
-                    let ea = if pre { addr.wrapping_add(4) } else { addr };
-                    if is_load {
-                        self.registers[i as usize] = bus.read_word(ea);
-                    } else {
-                        bus.write_word(ea, self.registers[i as usize]);
-                    }
-                    addr = addr.wrapping_add(4);
-                }
-            }
-            if write_back {
-                self.registers[rn] = if pre { addr } else { addr };
+                addr = addr.wrapping_add(4);
             }
         }
 
-        // If we loaded PC, check for THUMB switch
-        if is_load && reg_list & (1 << 15) != 0 {
+        // Restore original register bank
+        if use_user_bank && current_mode != 0x10 && current_mode != 0x1F {
+            self.switch_mode(0x10, current_mode);
+        }
+
+        // Write-back the updated base register.
+        // For loads: if Rn is in the register list, the loaded value wins (skip write-back).
+        let rn_in_list = reg_list & (1 << rn) != 0;
+        if write_back && !(is_load && rn_in_list) {
+            let new_base = if up {
+                base.wrapping_add(count * 4)
+            } else {
+                base.wrapping_sub(count * 4)
+            };
+            self.registers[rn] = new_base;
+        }
+
+        // If we loaded PC, handle mode switching
+        if is_load && has_pc {
             let new_pc = self.registers[R_PC];
+
+            // S bit with PC in list: copy SPSR to CPSR (exception return)
+            if s_bit {
+                let bank = mode_to_bank(self.cpsr & 0x1F);
+                self.write_cpsr(self.spsr[bank], 0xFFFF_FFFF);
+            }
+
             if new_pc & 1 != 0 {
                 self.cpsr |= CPSR_T;
                 self.registers[R_PC] = new_pc & !1;
@@ -1320,19 +1567,69 @@ impl Cpu {
 
         if is_load {
             self.registers[rd] = match sh {
-                1 => bus.read_halfword(effective) as u32,                    // LDRH
+                1 => {
+                    // LDRH: unaligned address → force-align and rotate right by 8
+                    if effective & 1 != 0 {
+                        let aligned = effective & !1;
+                        let val = bus.read_halfword(aligned) as u32;
+                        val.rotate_right(8)
+                    } else {
+                        bus.read_halfword(effective) as u32
+                    }
+                }
                 2 => bus.read_byte(effective) as i8 as i32 as u32,          // LDRSB
-                3 => bus.read_halfword(effective) as i16 as i32 as u32,     // LDRSH
+                3 => {
+                    // LDRSH: unaligned → loads signed byte instead
+                    if effective & 1 != 0 {
+                        bus.read_byte(effective) as i8 as i32 as u32
+                    } else {
+                        bus.read_halfword(effective) as i16 as i32 as u32
+                    }
+                }
                 _ => 0,
             };
         } else {
-            // STRH (sh=1 for store)
-            bus.write_halfword(effective, self.registers[rd] as u16);
+            // STRH: force-align address (ignore bit 0)
+            bus.write_halfword(effective & !1, self.registers[rd] as u16);
         }
 
-        if write_back || !pre {
+        if (write_back || !pre) && !(is_load && rd == rn) {
             self.registers[rn] = addr;
         }
+    }
+
+    // --- IRQ (Interrupt Request) entry ---
+    // When an interrupt fires, the CPU:
+    //   1. Saves CPSR → SPSR_IRQ
+    //   2. Switches to IRQ mode (0x12), disables IRQs (I-bit), enters ARM
+    //   3. Sets LR_IRQ = return address (PC+4 for ARM, PC+2 for THUMB, adjusted)
+    //   4. Jumps to the IRQ vector at 0x00000018 (BIOS)
+    fn enter_irq(&mut self) {
+        let old_cpsr = self.cpsr;
+        let _was_thumb = self.in_thumb_mode();
+
+        // ARM7TDMI IRQ: LR_irq = address of next instruction to execute + 4
+        // The handler returns with SUBS PC, LR, #4, giving the correct return address.
+        // At this point, self.registers[R_PC] is the address about to be fetched.
+        let return_addr = self.registers[R_PC].wrapping_add(4);
+
+        // Switch to IRQ mode (0x12)
+        let new_mode = 0x12;
+        self.switch_mode(old_cpsr & 0x1F, new_mode);
+
+        // Save CPSR to SPSR_IRQ
+        let bank = mode_to_bank(new_mode);
+        self.spsr[bank] = old_cpsr;
+
+        // Set LR to return address
+        self.registers[R_LR] = return_addr;
+
+        // Update CPSR: IRQ mode, IRQs disabled (I-bit), ARM state (clear T-bit)
+        self.cpsr = (old_cpsr & !0xFF) | new_mode | 0x80; // mode=IRQ, I=1, clear T
+        self.cpsr &= !CPSR_T;
+
+        // Jump to IRQ vector
+        self.registers[R_PC] = 0x00000018;
     }
 
     // --- SWI (Software Interrupt) — BIOS HLE ---
@@ -1356,7 +1653,24 @@ impl Cpu {
     fn handle_bios_call(&mut self, function: u32, bus: &mut crate::bus::Bus) {
         match function {
             0x00 => { /* SoftReset — not implemented */ }
-            0x05 => { /* VBlankIntrWait — stub: just return */ }
+            0x02 => {
+                // Halt — CPU sleeps until next interrupt.
+                // Advance cycles until an interrupt becomes pending.
+                for _ in 0..280_896 {
+                    bus.tick(1);
+                    if bus.irq_pending() { break; }
+                }
+            }
+            0x04 | 0x05 => {
+                // IntrWait (0x04) / VBlankIntrWait (0x05)
+                // Wait for interrupt. For VBlankIntrWait, wait specifically for VBlank.
+                let start_cycles = bus.cycles;
+                loop {
+                    bus.tick(1);
+                    if bus.irq_pending() { break; }
+                    if bus.cycles.wrapping_sub(start_cycles) > 280_896 { break; }
+                }
+            }
             0x06 => {
                 // Div: R0 = R0 / R1, R1 = R0 % R1, R3 = abs(R0/R1)
                 let num = self.registers[0] as i32;
@@ -1396,8 +1710,56 @@ impl Cpu {
                     }
                 }
             }
+            0x11 | 0x12 => {
+                // LZ77UnCompWram (0x11) / LZ77UnCompVram (0x12)
+                // R0 = source, R1 = dest
+                // Source format: 4-byte header (type/size), then LZ77 compressed stream
+                let src = self.registers[0];
+                let dst = self.registers[1];
+                let header = bus.read_word(src);
+                let decomp_size = (header >> 8) & 0x00FF_FFFF;
+
+                let mut src_pos = src + 4;
+                let mut dst_pos = dst;
+                let mut remaining = decomp_size;
+
+                while remaining > 0 {
+                    let flags = bus.read_byte(src_pos);
+                    src_pos += 1;
+
+                    for bit in (0..8).rev() {
+                        if remaining == 0 { break; }
+
+                        if flags & (1 << bit) == 0 {
+                            // Literal byte
+                            let b = bus.read_byte(src_pos);
+                            src_pos += 1;
+                            bus.write_byte(dst_pos, b);
+                            dst_pos += 1;
+                            remaining -= 1;
+                        } else {
+                            // Back-reference: 2 bytes -> (length, offset)
+                            let b1 = bus.read_byte(src_pos) as u32;
+                            let b2 = bus.read_byte(src_pos + 1) as u32;
+                            src_pos += 2;
+
+                            let length = ((b1 >> 4) & 0xF) + 3; // 3..18
+                            let offset = ((b1 & 0xF) << 8) | b2; // 1..4096
+                            let offset = offset + 1;
+
+                            for _ in 0..length {
+                                if remaining == 0 { break; }
+                                let b = bus.read_byte(dst_pos - offset);
+                                bus.write_byte(dst_pos, b);
+                                dst_pos += 1;
+                                remaining -= 1;
+                            }
+                        }
+                    }
+                }
+            }
             _ => {
-                // Unknown BIOS call — ignore for now
+                eprintln!("[WARN] Unknown BIOS call: SWI 0x{:02X}", function);
             }
         }
     }
@@ -1597,6 +1959,45 @@ mod tests {
         ]);
         assert_eq!(cpu.registers[0], 0xFF00_0000);
         assert_eq!(cpu.registers[1], 0xFFFF_FFFF); // Sign bit filled in
+    }
+
+    #[test]
+    fn mov_lsr_zero_means_lsr_32() {
+        // MOV R1, R0, LSR #0 is encoded as LSR #32 → result = 0
+        // Encoding: 0xE1A01020 = MOV R1, R0, LSR #0
+        let (cpu, _) = run_program(&[
+            0xE3A0_0080, // MOV R0, #128
+            0xE1A0_1020, // MOV R1, R0, LSR #0 (= LSR #32)
+        ]);
+        assert_eq!(cpu.registers[1], 0); // 128 >> 32 = 0
+    }
+
+    #[test]
+    fn mov_asr_zero_means_asr_32() {
+        // MOV R1, R0, ASR #0 is encoded as ASR #32 → all sign bits
+        // Encoding: 0xE1A01040 = MOV R1, R0, ASR #0
+        let (cpu, _) = run_program(&[
+            0xE3E0_0000, // MVN R0, #0 → R0 = 0xFFFFFFFF
+            0xE1A0_0C00, // MOV R0, R0, LSL #24 → R0 = 0xFF000000
+            0xE1A0_1040, // MOV R1, R0, ASR #0 (= ASR #32) → R1 = 0xFFFFFFFF
+        ]);
+        assert_eq!(cpu.registers[1], 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn mov_rrx() {
+        // MOV R1, R0, ROR #0 is encoded as RRX (rotate right through carry by 1)
+        // Encoding: 0xE1A01060 = MOV R1, R0, RRX
+        // R0 = 0x80000001, C = 1 → RRX → carry_out=1, result = (1<<31) | (R0>>1) = 0xC0000000
+        // But we need to set carry first. Use MOVS to set carry.
+        // ADDS R2, R0, R0 with R0=0x80000000 → carry=1 (overflow)
+        let (cpu, _) = run_program(&[
+            0xE3A0_0102, // MOV R0, #0x80000000 (imm=0x80, rotate=2 → 0x80000000)
+            0xE090_2000, // ADDS R2, R0, R0  → sets carry=1
+            0xE3A0_0001, // MOV R0, #1
+            0xE1A0_1060, // MOV R1, R0, RRX → result = (C<<31) | (1>>1) = 0x80000000
+        ]);
+        assert_eq!(cpu.registers[1], 0x8000_0000);
     }
 
     #[test]

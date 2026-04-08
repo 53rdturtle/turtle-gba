@@ -25,10 +25,11 @@ This project follows an educational-first approach. Claude must:
 - **Connect to the bigger picture** — how this piece fits into the full emulator.
 
 ### Documenting the Journey
-- **Write teaching notes to `docs/`** — after each milestone or major concept, create/update a markdown file in `docs/` capturing the explanation (what the hardware does, why we modeled it this way, key concepts learned).
+- **MANDATORY: Write teaching notes to `docs/` after every milestone or bug-fix session.** Do NOT wait to be asked. After finishing code changes, always create/update a markdown file in `docs/` capturing the explanation (what the hardware does, why we modeled it this way, key concepts learned). This is a blocking requirement — a task is not complete until the doc is written.
 - **Organize by milestone** — e.g., `docs/01-cpu-basics.md`, `docs/02-memory-map.md`, etc.
 - **Include diagrams** (ASCII art) and examples where helpful.
 - These docs serve as the user's personal reference — written in plain language, not textbook style.
+- **Each doc should teach the hardware concept first, then explain the bug/implementation.** The reader should understand *why* the hardware works this way, not just what we changed.
 
 ### General Guidelines
 - **Prefer clarity over cleverness** — readable code that teaches is better than optimized code that obscures.
