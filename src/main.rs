@@ -116,51 +116,43 @@ fn run_with_window(cpu: &mut Cpu, bus: &mut Bus) {
     // Cap at ~60 FPS (GBA runs at ~59.73 Hz)
     window.set_target_fps(60);
 
-    let mut total_cycles: u32 = 0;
-    let mut frame_count: u64 = 0;
+    let mut fps_timer = std::time::Instant::now();
+    let mut fps_frame_count: u64 = 0;
 
     while window.is_open() && !window.is_key_down(Key::Escape) {
-        // Run multiple GBA frames per window frame for speed.
-        // We only render the LAST one so double-buffering doesn't flicker.
-        // But we poll input EVERY frame so button presses aren't missed.
         for _ in 0..FRAMES_PER_RENDER {
             update_keyinput(&window, bus);
-            let frame_start = total_cycles;
-            while total_cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
-                let pc = cpu.registers[R_PC];
-                let in_thumb = cpu.in_thumb_mode();
-
-                let is_halt = if in_thumb {
-                    bus.read_halfword(pc) == 0
-                } else {
-                    bus.read_word(pc) == 0
-                };
-                if is_halt {
-                    break;
+            // Use bus.cycles as the single timing source — this stays in sync
+            // even when BIOS calls (Halt, VBlankIntrWait) advance cycles internally.
+            let frame_start = bus.cycles;
+            while bus.cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
+                let cycles = cpu.step(bus);
+                if cycles == 0 {
+                    break; // Halt
                 }
-
-                cpu.step(bus);
-                bus.tick(1);
-                total_cycles = total_cycles.wrapping_add(1);
+                bus.tick(cycles);
             }
 
             // Advance timing to frame boundary
-            while total_cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
+            while bus.cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
                 bus.tick(1);
-                total_cycles = total_cycles.wrapping_add(1);
             }
         }
 
-        // Render and display (only the final frame state)
+        // Render and display
         let framebuf = ppu::render_frame(&bus.vram, &bus.palette, &bus.oam, &bus.io);
         window.update_with_buffer(&framebuf, SCREEN_WIDTH, SCREEN_HEIGHT)
             .expect("Failed to update window");
 
-        frame_count += 1;
-        if frame_count % 60 == 0 {
-            println!("[Frame {}] PC=0x{:08X} mode={}",
-                frame_count, cpu.registers[R_PC],
-                if cpu.in_thumb_mode() { "THUMB" } else { "ARM" });
+        fps_frame_count += 1;
+
+        // Update FPS in window title every second
+        let elapsed = fps_timer.elapsed();
+        if elapsed.as_secs_f64() >= 1.0 {
+            let fps = fps_frame_count as f64 / elapsed.as_secs_f64();
+            window.set_title(&format!("Turtle GBA — {:.0} FPS", fps));
+            fps_frame_count = 0;
+            fps_timer = std::time::Instant::now();
         }
     }
 }
@@ -257,17 +249,9 @@ fn run_frames(cpu: &mut Cpu, bus: &mut Bus, keyinput: u16, num_frames: u32) {
         bus.keyinput = keyinput;
         let frame_start = bus.cycles;
         while bus.cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
-            let pc = cpu.registers[R_PC];
-            let in_thumb = cpu.in_thumb_mode();
-            let is_halt = if in_thumb {
-                bus.read_halfword(pc) == 0
-            } else {
-                bus.read_word(pc) == 0
-            };
-            if is_halt { break; }
-
-            cpu.step(bus);
-            bus.tick(1);
+            let cycles = cpu.step(bus);
+            if cycles == 0 { break; }
+            bus.tick(cycles);
         }
         // Advance timing to frame boundary
         while bus.cycles.wrapping_sub(frame_start) < CYCLES_PER_FRAME {
@@ -349,16 +333,6 @@ fn run_headless(cpu: &mut Cpu, bus: &mut Bus, args: &[String]) {
         }
         last_pc = pc;
 
-        let is_halt = if in_thumb {
-            bus.read_halfword(pc) == 0
-        } else {
-            bus.read_word(pc) == 0
-        };
-        if is_halt {
-            println!("[HALT] instruction=0 at PC=0x{:08X} after {} steps", pc, step);
-            break;
-        }
-
         let should_print = verbose || step < 20;
         if should_print {
             let desc = if in_thumb {
@@ -371,8 +345,12 @@ fn run_headless(cpu: &mut Cpu, bus: &mut Bus, args: &[String]) {
                 step, pc, desc, cpu.registers[0], cpu.registers[1], cpu.cpsr);
         }
 
-        cpu.step(bus);
-        bus.tick(1);
+        let cycles = cpu.step(bus);
+        if cycles == 0 {
+            println!("[HALT] instruction=0 at PC=0x{:08X} after {} steps", pc, step);
+            break;
+        }
+        bus.tick(cycles);
 
         if step == max_steps - 1 {
             println!("\n[LIMIT] Stopped after {} steps (safety limit)", max_steps);

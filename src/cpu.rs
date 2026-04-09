@@ -403,7 +403,37 @@ impl Cpu {
 
     /// Execute one CPU step: fetch an instruction, decode it, execute it.
     /// Returns true if execution should continue, false to halt.
-    pub fn step(&mut self, bus: &mut crate::bus::Bus) -> bool {
+    /// Estimate the fetch waitstate cost for an instruction at the given PC.
+    ///
+    /// The GBA has different memory regions with different access speeds:
+    ///   BIOS/IWRAM: 0 extra cycles (fast, on-chip)
+    ///   EWRAM:      2 extra cycles (16-bit bus, off-chip)
+    ///   ROM (WS0):  2 extra cycles for sequential THUMB, 4 for sequential ARM
+    ///               (ROM has a 16-bit bus, so 32-bit ARM fetches need 2 accesses)
+    ///
+    /// Real hardware uses WAITCNT (0x04000204) to configure these, but most
+    /// games use the default settings. This approximation covers the common case.
+    fn fetch_waitstates(&self, pc: u32) -> u32 {
+        match pc >> 24 {
+            0x00 => 0,       // BIOS — no wait
+            0x02 => 2,       // EWRAM — 16-bit bus, 2 wait cycles
+            0x03 => 0,       // IWRAM — fast, no wait
+            0x08..=0x0D => { // ROM (WS0/1/2) — 16-bit bus
+                if self.in_thumb_mode() { 2 } else { 4 } // ARM needs 2 sequential accesses
+            }
+            _ => 0,
+        }
+    }
+
+    /// Execute one instruction and return the number of cycles consumed.
+    /// Returns 0 to signal a halt (instruction was 0x00000000).
+    ///
+    /// Cycle cost = instruction execution + fetch waitstates.
+    /// Execution costs (ARM7TDMI approximations):
+    ///   ALU ops: 1 cycle    Branches: 3 cycles
+    ///   LDR:     3 cycles   STR:      2 cycles
+    ///   LDM/STM: 2+n cycles MUL:      4 cycles
+    pub fn step(&mut self, bus: &mut crate::bus::Bus) -> u32 {
         // Check for pending IRQ: CPSR I-bit must be clear (IRQs enabled)
         if self.cpsr & 0x80 == 0 && bus.irq_pending() {
             self.enter_irq();
@@ -415,6 +445,7 @@ impl Cpu {
 
         // FETCH: read 32-bit instruction at the PC
         let pc = self.registers[R_PC];
+        let wait = self.fetch_waitstates(pc);
         let instruction = bus.read_word(pc);
 
         // Advance PC to next instruction (4 bytes ahead for ARM mode).
@@ -422,62 +453,67 @@ impl Cpu {
 
         // If instruction is 0, treat as halt (no real instruction is all zeros in practice)
         if instruction == 0 {
-            return false;
+            return 0;
         }
 
         // Check condition code (bits 31-28) — should we even execute this?
         let cond = (instruction >> 28) & 0xF;
         if !self.condition_met(cond) {
-            return true; // Skip this instruction, but keep running
+            return 1 + wait; // Skip this instruction, but keep running
         }
 
         // DECODE: determine instruction type from bit patterns
         let bits_27_26 = (instruction >> 26) & 0b11;
         let bit_25 = (instruction >> 25) & 1;
 
-        match bits_27_26 {
+        let exec_cycles = match bits_27_26 {
             0b00 => {
                 // Check for special instructions encoded in the data processing space
                 if self.try_special_arm(instruction, bus) {
-                    return true;
+                    let is_bx = (instruction & 0x0FFF_FFF0) == 0x012F_FF10;
+                    let is_mul = (instruction & 0x0FC0_00F0) == 0x0000_0090;
+                    return (if is_bx { 3 } else if is_mul { 4 } else { 1 }) + wait;
                 }
-                // Halfword/signed transfer: bits 27-26=00, bit 7=1, bit 4=1, bit 25=0
-                // Pattern: xxxx 000x xxxx xxxx xxxx xxxx 1xx1 xxxx
+                // Halfword/signed transfer
                 if bit_25 == 0 && (instruction & 0x90) == 0x90 && (instruction & 0x0200_0000) == 0 {
                     let sh = (instruction >> 5) & 0x3;
                     if sh != 0 {
-                        // Halfword / signed byte transfer
                         self.execute_halfword_transfer(instruction, bus);
-                        return true;
+                        let is_load = (instruction >> 20) & 1 == 1;
+                        return (if is_load { 3 } else { 2 }) + wait;
                     }
                 }
-                // Data processing (ALU operations): MOV, ADD, SUB, CMP, AND, ORR, etc.
+                // Data processing (ALU operations)
                 self.execute_data_processing(instruction, bit_25);
+                1
             }
             0b01 => {
-                // Single data transfer: LDR (load from memory), STR (store to memory)
                 self.execute_single_transfer(instruction, bus);
+                let is_load = (instruction >> 20) & 1 == 1;
+                if is_load { 3 } else { 2 }
             }
             0b10 => {
                 if (instruction >> 25) & 1 == 1 {
-                    // Branch (B) and Branch with Link (BL)
                     self.execute_branch(instruction);
+                    3
                 } else {
-                    // Block data transfer (LDM/STM)
                     self.execute_block_transfer(instruction, bus);
+                    let reg_count = (instruction & 0xFFFF).count_ones();
+                    2 + reg_count
                 }
             }
             0b11 => {
                 if (instruction >> 24) & 0xF == 0xF {
-                    // SWI — Software Interrupt (BIOS call)
                     self.execute_swi(instruction, bus);
+                    3
+                } else {
+                    1
                 }
-                // else: Coprocessor — later
             }
             _ => unreachable!(),
-        }
+        };
 
-        true
+        exec_cycles + wait
     }
 
     // --- Special ARM instructions ---
@@ -620,15 +656,16 @@ impl Cpu {
     // The CPU switches to THUMB via BX with bit 0 set in the target address.
     // THUMB has ~19 instruction formats, identified by the top bits.
 
-    fn step_thumb(&mut self, bus: &mut crate::bus::Bus) -> bool {
+    fn step_thumb(&mut self, bus: &mut crate::bus::Bus) -> u32 {
         let pc = self.registers[R_PC];
+        let wait = self.fetch_waitstates(pc);
         let instruction = bus.read_halfword(pc) as u32;
 
         // Advance PC by 2 (THUMB instructions are 16 bits = 2 bytes)
         self.registers[R_PC] = pc.wrapping_add(2);
 
         if instruction == 0 {
-            return false; // Halt convention
+            return 0; // Halt convention
         }
 
         // Decode by top bits — THUMB uses the top 3-6 bits to identify format
@@ -636,91 +673,99 @@ impl Cpu {
         let top5 = (instruction >> 11) & 0x1F;
         let top3 = (instruction >> 13) & 0x7;
 
-        match top3 {
+        let exec_cycles = match top3 {
             0b000 => {
                 if top5 == 0b00011 {
-                    // Format 2: Add/Subtract (register or immediate)
                     self.thumb_add_sub(instruction);
                 } else {
-                    // Format 1: Move shifted register (LSL, LSR, ASR)
                     self.thumb_shift(instruction);
                 }
+                1
             }
             0b001 => {
-                // Format 3: Immediate operations (MOV, CMP, ADD, SUB with 8-bit immediate)
                 self.thumb_immediate(instruction);
+                1
             }
             0b010 => {
                 if top5 == 0b01000 {
                     if (instruction >> 10) & 1 == 1 {
-                        // Format 5: Hi register operations / BX
                         self.thumb_hi_reg_bx(instruction, bus);
+                        let op = (instruction >> 8) & 0x3;
+                        if op == 3 { 3 } else { 1 }
                     } else {
-                        // Format 4: ALU operations (16 ops between low registers)
                         self.thumb_alu(instruction);
+                        1
                     }
                 } else if top5 == 0b01001 {
-                    // Format 6: PC-relative load (LDR Rd, [PC, #imm])
                     self.thumb_pc_relative_load(instruction, bus);
+                    3
                 } else {
-                    // Format 7/8: Load/store with register offset
                     self.thumb_load_store_reg(instruction, bus);
+                    3
                 }
             }
             0b011 => {
-                // Format 9: Load/store with immediate offset
                 self.thumb_load_store_imm(instruction, bus);
+                let is_load = (instruction >> 11) & 1 == 1;
+                if is_load { 3 } else { 2 }
             }
             0b100 => {
                 if top5 & 0x1E == 0b10000 {
-                    // Format 10: Load/store halfword
                     self.thumb_load_store_halfword(instruction, bus);
+                    let is_load = (instruction >> 11) & 1 == 1;
+                    if is_load { 3 } else { 2 }
                 } else {
-                    // Format 11: SP-relative load/store
                     self.thumb_sp_relative(instruction, bus);
+                    let is_load = (instruction >> 11) & 1 == 1;
+                    if is_load { 3 } else { 2 }
                 }
             }
             0b101 => {
                 if top5 & 0x1E == 0b10100 {
-                    // Format 12: Load address (from PC or SP)
                     self.thumb_load_address(instruction);
+                    1
                 } else if top8 == 0b10110000 {
-                    // Format 13: Add offset to SP
                     self.thumb_sp_offset(instruction);
+                    1
                 } else if top5 & 0x1E == 0b10110 {
-                    // Format 14: Push/Pop registers
                     self.thumb_push_pop(instruction, bus);
+                    let reg_count = (instruction & 0xFF).count_ones()
+                        + ((instruction >> 8) & 1);
+                    2 + reg_count
                 } else {
-                    // Unknown
+                    1
                 }
             }
             0b110 => {
                 if top5 & 0x1E == 0b11000 {
-                    // Format 15: Multiple load/store (LDMIA/STMIA)
                     self.thumb_multiple_load_store(instruction, bus);
+                    let reg_count = (instruction & 0xFF).count_ones();
+                    2 + reg_count
                 } else if top8 == 0b11011111 {
-                    // Format 17: SWI (Software Interrupt)
-                    // Must check BEFORE Format 16 — SWI (0xDF__) shares top5=0b11011
-                    // with conditional branches, but uses condition field 0xF
                     self.execute_swi_thumb(instruction, bus);
+                    3
                 } else if top5 == 0b11011 || top5 == 0b11010 {
-                    // Format 16: Conditional branch (conditions 0x0-0xE)
                     self.thumb_conditional_branch(instruction);
+                    3
+                } else {
+                    1
                 }
             }
             0b111 => {
                 if top5 == 0b11100 {
-                    // Format 18: Unconditional branch (B)
                     self.thumb_branch(instruction);
+                    3
                 } else if top5 & 0x1E == 0b11110 {
-                    // Format 19: Long branch with link (BL, two-instruction sequence)
                     self.thumb_long_branch(instruction);
+                    1
+                } else {
+                    1
                 }
             }
-            _ => {}
-        }
+            _ => { 1 }
+        };
 
-        true
+        exec_cycles + wait
     }
 
     // --- THUMB Format 1: Move shifted register ---
@@ -1819,7 +1864,7 @@ mod tests {
 
         let mut cpu = Cpu::new();
         // Run until halt (instruction == 0)
-        while cpu.step(&mut bus) {}
+        while cpu.step(&mut bus) != 0 {}
         (cpu, bus)
     }
 
