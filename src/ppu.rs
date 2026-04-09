@@ -33,6 +33,7 @@ pub fn render_frame(vram: &[u8], palette: &[u8], oam: &[u8], io: &[u8]) -> Vec<u
 
     match mode {
         0 => render_composited(vram, palette, oam, io, dispcnt),
+        1 | 2 => render_composited(vram, palette, oam, io, dispcnt),
         3 => render_mode3_blended(vram, io),
         4 => render_mode4_blended(vram, palette, oam, io, dispcnt),
         _ => vec![0x00333333; SCREEN_WIDTH * SCREEN_HEIGHT],
@@ -74,10 +75,24 @@ fn render_composited(
     ];
     let mut bg_priorities: [u8; 4] = [3; 4]; // Default to lowest priority
 
+    let mode = dispcnt & 0x7;
+
     for &(priority, bg) in &bg_layers {
         let bgcnt = read_io_u16(io, 0x08 + bg * 2);
         bg_priorities[bg] = priority;
-        render_text_bg_layer(vram, palette, io, &mut bg_pixels[bg], bg, bgcnt);
+
+        // In Mode 1, BG2 is affine. In Mode 2, BG2 and BG3 are affine.
+        let is_affine = match mode {
+            1 => bg == 2,
+            2 => bg == 2 || bg == 3,
+            _ => false,
+        };
+
+        if is_affine {
+            render_affine_bg_layer(vram, palette, io, &mut bg_pixels[bg], bg, bgcnt);
+        } else {
+            render_text_bg_layer(vram, palette, io, &mut bg_pixels[bg], bg, bgcnt);
+        }
     }
 
     // Pre-render OBJ layer: color + per-pixel priority
@@ -352,12 +367,186 @@ fn render_text_bg_layer(
     }
 }
 
-/// Render all OBJ sprites into pixel and priority buffers.
+/// Render an affine (rotation/scaling) background layer.
+///
+/// Affine BGs use a 2x2 matrix (PA, PB, PC, PD) and a reference point (X0, Y0)
+/// to transform screen coordinates into background texture coordinates:
+///
+///   tex_x = X0 + PA * screen_x + PB * screen_y
+///   tex_y = Y0 + PC * screen_x + PD * screen_y
+///
+/// Key differences from regular (text) backgrounds:
+///   - Tile map entries are 8 bits (just a tile index, no flip/palette)
+///   - Always 8bpp (256-color, single palette)
+///   - Map is a square: 16x16, 32x32, 64x64, or 128x128 tiles
+///   - Overflow bit (BGxCNT bit 13) controls wrapping vs transparent
+fn render_affine_bg_layer(
+    vram: &[u8], palette: &[u8], io: &[u8],
+    pixels: &mut [u32], bg: usize, bgcnt: u16,
+) {
+    let cbb = ((bgcnt >> 2) & 0x3) as usize;
+    let sbb = ((bgcnt >> 8) & 0x1F) as usize;
+    let wraparound = bgcnt & (1 << 13) != 0;
+    let size_bits = (bgcnt >> 14) & 0x3;
+
+    // Affine BG sizes (in tiles): 16x16, 32x32, 64x64, 128x128
+    let map_size = match size_bits {
+        0 => 16,
+        1 => 32,
+        2 => 64,
+        3 => 128,
+        _ => unreachable!(),
+    };
+    let bg_size_px = map_size * 8; // Size in pixels
+
+    let tile_base = cbb * 0x4000;
+    let map_base = sbb * 0x800;
+
+    // Read affine parameters from I/O registers.
+    // BG2: PA=0x20, PB=0x22, PC=0x24, PD=0x26, X=0x28, Y=0x2C
+    // BG3: PA=0x30, PB=0x32, PC=0x34, PD=0x36, X=0x38, Y=0x3C
+    let param_base = if bg == 3 { 0x30 } else { 0x20 };
+
+    // PA/PB/PC/PD are 16-bit signed, 8.8 fixed-point
+    let pa = read_io_i16(io, param_base) as i32;
+    let pb = read_io_i16(io, param_base + 2) as i32;
+    let pc = read_io_i16(io, param_base + 4) as i32;
+    let pd = read_io_i16(io, param_base + 6) as i32;
+
+    // Reference point X0/Y0 are 32-bit signed, 20.8 fixed-point
+    // (28 bits used: 20 integer + 8 fractional, sign-extended to 32)
+    let ref_base = if bg == 3 { 0x38 } else { 0x28 };
+    let x0 = read_io_i32(io, ref_base);
+    let y0 = read_io_i32(io, ref_base + 4);
+
+    for screen_y in 0..SCREEN_HEIGHT {
+        // Texture coordinate at (0, screen_y), then we walk right adding (PA, PC)
+        let mut tex_x = x0 + pb * screen_y as i32;
+        let mut tex_y = y0 + pd * screen_y as i32;
+
+        for screen_x in 0..SCREEN_WIDTH {
+            // Convert from 8.8 fixed-point to integer pixel coordinates
+            let bg_x = tex_x >> 8;
+            let bg_y = tex_y >> 8;
+
+            // Advance texture position for next pixel
+            tex_x += pa;
+            tex_y += pc;
+
+            // Check bounds
+            let (final_x, final_y) = if wraparound {
+                // Wrap around the background
+                (bg_x.rem_euclid(bg_size_px as i32), bg_y.rem_euclid(bg_size_px as i32))
+            } else {
+                // Out of bounds = transparent
+                if bg_x < 0 || bg_y < 0 || bg_x >= bg_size_px as i32 || bg_y >= bg_size_px as i32 {
+                    continue;
+                }
+                (bg_x, bg_y)
+            };
+
+            // Which tile in the map?
+            let tile_x = (final_x / 8) as usize;
+            let tile_y = (final_y / 8) as usize;
+            let pixel_in_tile_x = (final_x % 8) as usize;
+            let pixel_in_tile_y = (final_y % 8) as usize;
+
+            // Affine map entries are 8 bits (just a tile index)
+            let map_addr = map_base + tile_y * map_size + tile_x;
+            let tile_id = if map_addr < vram.len() { vram[map_addr] as usize } else { 0 };
+
+            // Always 8bpp: 64 bytes per tile, 1 byte per pixel
+            let pixel_addr = tile_base + tile_id * 64 + pixel_in_tile_y * 8 + pixel_in_tile_x;
+            let color_index = if pixel_addr < vram.len() { vram[pixel_addr] as usize } else { 0 };
+
+            if color_index == 0 { continue; } // Transparent
+
+            pixels[screen_y * SCREEN_WIDTH + screen_x] = palette_to_rgb(palette, color_index);
+        }
+    }
+}
+
+/// Read a 16-bit signed value from IO registers.
+fn read_io_i16(io: &[u8], offset: usize) -> i16 {
+    ((io[offset] as u16) | ((io[offset + 1] as u16) << 8)) as i16
+}
+
+/// Read a 32-bit signed value from IO registers (for affine reference points).
+/// The value is 20.8 fixed-point, sign-extended from 28 bits.
+fn read_io_i32(io: &[u8], offset: usize) -> i32 {
+    let raw = (io[offset] as u32)
+        | ((io[offset + 1] as u32) << 8)
+        | ((io[offset + 2] as u32) << 16)
+        | ((io[offset + 3] as u32) << 24);
+    // Sign-extend from bit 27
+    if raw & (1 << 27) != 0 {
+        (raw | 0xF000_0000) as i32
+    } else {
+        (raw & 0x0FFF_FFFF) as i32
+    }
+}
+
+/// Look up a pixel's color index from OBJ tile data.
+///
+/// Given texture coordinates within a sprite, finds the correct tile
+/// and reads the palette index. Returns 0 for transparent.
+fn obj_tile_pixel(
+    vram: &[u8], tex_x: usize, tex_y: usize,
+    obj_w: usize, tile_id: usize, is_8bpp: bool, mapping_1d: bool,
+) -> usize {
+    let tile_base: usize = 0x10000;
+    let tile_col = tex_x / 8;
+    let tile_row = tex_y / 8;
+    let pixel_in_tile_x = tex_x % 8;
+    let pixel_in_tile_y = tex_y % 8;
+
+    let actual_tile = if mapping_1d {
+        if is_8bpp {
+            tile_id + tile_row * (obj_w / 8) * 2 + tile_col * 2
+        } else {
+            tile_id + tile_row * (obj_w / 8) + tile_col
+        }
+    } else {
+        let tiles_per_row = if is_8bpp { 16 } else { 32 };
+        tile_id + tile_row * tiles_per_row + tile_col
+    };
+
+    if is_8bpp {
+        let addr = tile_base + actual_tile * 32 + pixel_in_tile_y * 8 + pixel_in_tile_x;
+        if addr < vram.len() { vram[addr] as usize } else { 0 }
+    } else {
+        let addr = tile_base + actual_tile * 32 + pixel_in_tile_y * 4 + pixel_in_tile_x / 2;
+        let byte = if addr < vram.len() { vram[addr] } else { 0 };
+        if pixel_in_tile_x & 1 == 0 {
+            (byte & 0x0F) as usize
+        } else {
+            ((byte >> 4) & 0x0F) as usize
+        }
+    }
+}
+
+/// Read an OBJ affine parameter group from OAM.
+///
+/// Affine parameters are stored in bytes 6-7 of every OAM entry,
+/// grouped in sets of 4 entries. Group N uses entries N*4..N*4+3.
+fn read_obj_affine(oam: &[u8], group: usize) -> (i16, i16, i16, i16) {
+    let pa_off = group * 32 + 6;   // Entry N*4+0, bytes 6-7
+    let pb_off = group * 32 + 14;  // Entry N*4+1, bytes 6-7
+    let pc_off = group * 32 + 22;  // Entry N*4+2, bytes 6-7
+    let pd_off = group * 32 + 30;  // Entry N*4+3, bytes 6-7
+    let read = |off: usize| -> i16 {
+        if off + 1 < oam.len() {
+            ((oam[off] as u16) | ((oam[off + 1] as u16) << 8)) as i16
+        } else { 0x100 } // 1.0 in 8.8 fixed-point as fallback
+    };
+    (read(pa_off), read(pb_off), read(pc_off), read(pd_off))
+}
+
+/// Render all OBJ sprites (regular and affine) into pixel and priority buffers.
 fn render_obj_layer(
     vram: &[u8], palette: &[u8], oam: &[u8], dispcnt: u16,
     pixels: &mut [u32], priorities: &mut [u8],
 ) {
-    let tile_base: usize = 0x10000;
     let mapping_1d = dispcnt & (1 << 6) != 0;
 
     let obj_sizes: [[(usize, usize); 4]; 3] = [
@@ -377,7 +566,9 @@ fn render_obj_layer(
 
         let obj_mode = (attr0 >> 8) & 0x3;
         if obj_mode == 2 { continue; }  // Hidden
-        if obj_mode == 1 || obj_mode == 3 { continue; } // Affine — skip for now
+
+        let is_affine = obj_mode == 1 || obj_mode == 3;
+        let is_double_size = obj_mode == 3;
 
         let is_8bpp = attr0 & (1 << 13) != 0;
         let shape = ((attr0 >> 14) & 0x3) as usize;
@@ -393,62 +584,103 @@ fn render_obj_layer(
             if raw >= 256 { raw - 512 } else { raw }
         };
 
-        let h_flip = attr1 & (1 << 12) != 0;
-        let v_flip = attr1 & (1 << 13) != 0;
         let tile_id = (attr2 & 0x3FF) as usize;
         let pal_bank = ((attr2 >> 12) & 0xF) as usize;
 
-        for py in 0..obj_h {
-            let screen_y = (y + py as i32) & 0xFF;
-            if screen_y < 0 || screen_y >= SCREEN_HEIGHT as i32 { continue; }
+        // Bounding box on screen: double-size sprites use 2x the area
+        let (bound_w, bound_h) = if is_double_size {
+            (obj_w * 2, obj_h * 2)
+        } else {
+            (obj_w, obj_h)
+        };
 
-            for px in 0..obj_w {
-                let screen_x = x + px as i32;
-                if screen_x < 0 || screen_x >= SCREEN_WIDTH as i32 { continue; }
+        if is_affine {
+            // Read affine parameters from OAM
+            let affine_group = ((attr1 >> 9) & 0x1F) as usize;
+            let (pa, pb, pc, pd) = read_obj_affine(oam, affine_group);
+            let pa = pa as i32;
+            let pb = pb as i32;
+            let pc = pc as i32;
+            let pd = pd as i32;
 
-                let tex_x = if h_flip { obj_w - 1 - px } else { px };
-                let tex_y = if v_flip { obj_h - 1 - py } else { py };
+            // The center of the sprite in texture space
+            let half_w = (obj_w / 2) as i32;
+            let half_h = (obj_h / 2) as i32;
+            // The center of the bounding box on screen
+            let center_x = (bound_w / 2) as i32;
+            let center_y = (bound_h / 2) as i32;
 
-                let tile_col = tex_x / 8;
-                let tile_row = tex_y / 8;
-                let pixel_in_tile_x = tex_x % 8;
-                let pixel_in_tile_y = tex_y % 8;
+            for py in 0..bound_h {
+                let screen_y = (y + py as i32) & 0xFF;
+                if screen_y < 0 || screen_y >= SCREEN_HEIGHT as i32 { continue; }
 
-                let actual_tile = if mapping_1d {
-                    if is_8bpp {
-                        tile_id + tile_row * (obj_w / 8) * 2 + tile_col * 2
-                    } else {
-                        tile_id + tile_row * (obj_w / 8) + tile_col
+                // Offset from bounding box center
+                let dy = py as i32 - center_y;
+
+                for px in 0..bound_w {
+                    let screen_x = x + px as i32;
+                    if screen_x < 0 || screen_x >= SCREEN_WIDTH as i32 { continue; }
+
+                    let dx = px as i32 - center_x;
+
+                    // Apply affine matrix to find texture coordinate
+                    let tex_x = half_w + ((pa * dx + pb * dy) >> 8);
+                    let tex_y = half_h + ((pc * dx + pd * dy) >> 8);
+
+                    // Check if inside the sprite texture
+                    if tex_x < 0 || tex_y < 0 || tex_x >= obj_w as i32 || tex_y >= obj_h as i32 {
+                        continue;
                     }
-                } else {
-                    let tiles_per_row = if is_8bpp { 16 } else { 32 };
-                    tile_id + tile_row * tiles_per_row + tile_col
-                };
 
-                let color_index = if is_8bpp {
-                    let addr = tile_base + actual_tile * 32 + pixel_in_tile_y * 8 + pixel_in_tile_x;
-                    if addr < vram.len() { vram[addr] as usize } else { 0 }
-                } else {
-                    let addr = tile_base + actual_tile * 32 + pixel_in_tile_y * 4 + pixel_in_tile_x / 2;
-                    let byte = if addr < vram.len() { vram[addr] } else { 0 };
-                    if pixel_in_tile_x & 1 == 0 {
-                        (byte & 0x0F) as usize
+                    let color_index = obj_tile_pixel(
+                        vram, tex_x as usize, tex_y as usize,
+                        obj_w, tile_id, is_8bpp, mapping_1d,
+                    );
+                    if color_index == 0 { continue; }
+
+                    let pal_index = if is_8bpp {
+                        256 + color_index
                     } else {
-                        ((byte >> 4) & 0x0F) as usize
-                    }
-                };
+                        256 + pal_bank * 16 + color_index
+                    };
 
-                if color_index == 0 { continue; }
+                    let si = screen_y as usize * SCREEN_WIDTH + screen_x as usize;
+                    pixels[si] = palette_to_rgb(palette, pal_index);
+                    priorities[si] = obj_priority;
+                }
+            }
+        } else {
+            // Regular (non-affine) sprite — direct pixel mapping with optional flip
+            let h_flip = attr1 & (1 << 12) != 0;
+            let v_flip = attr1 & (1 << 13) != 0;
 
-                let pal_index = if is_8bpp {
-                    256 + color_index
-                } else {
-                    256 + pal_bank * 16 + color_index
-                };
+            for py in 0..obj_h {
+                let screen_y = (y + py as i32) & 0xFF;
+                if screen_y < 0 || screen_y >= SCREEN_HEIGHT as i32 { continue; }
 
-                let si = screen_y as usize * SCREEN_WIDTH + screen_x as usize;
-                pixels[si] = palette_to_rgb(palette, pal_index);
-                priorities[si] = obj_priority;
+                for px in 0..obj_w {
+                    let screen_x = x + px as i32;
+                    if screen_x < 0 || screen_x >= SCREEN_WIDTH as i32 { continue; }
+
+                    let tex_x = if h_flip { obj_w - 1 - px } else { px };
+                    let tex_y = if v_flip { obj_h - 1 - py } else { py };
+
+                    let color_index = obj_tile_pixel(
+                        vram, tex_x, tex_y,
+                        obj_w, tile_id, is_8bpp, mapping_1d,
+                    );
+                    if color_index == 0 { continue; }
+
+                    let pal_index = if is_8bpp {
+                        256 + color_index
+                    } else {
+                        256 + pal_bank * 16 + color_index
+                    };
+
+                    let si = screen_y as usize * SCREEN_WIDTH + screen_x as usize;
+                    pixels[si] = palette_to_rgb(palette, pal_index);
+                    priorities[si] = obj_priority;
+                }
             }
         }
     }
