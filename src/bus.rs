@@ -49,6 +49,25 @@ impl DmaChannel {
     fn repeat(&self) -> bool { self.control & (1 << 9) != 0 }
 }
 
+/// Timer state. The GBA has 4 hardware timers that count up and
+/// generate interrupts on overflow. They can be clocked by the
+/// system clock (with prescaler) or cascaded from the previous timer.
+#[derive(Clone)]
+pub struct Timer {
+    /// Current counter value (16-bit, counts up toward 0xFFFF)
+    pub counter: u16,
+    /// Reload value — loaded into counter on overflow or enable
+    pub reload: u16,
+    /// Prescaler accumulator — tracks sub-tick fractional cycles
+    pub prescaler_counter: u32,
+}
+
+impl Timer {
+    fn new() -> Self {
+        Timer { counter: 0, reload: 0, prescaler_counter: 0 }
+    }
+}
+
 pub struct Bus {
     /// BIOS memory — 16 KB
     pub bios: Vec<u8>,
@@ -82,6 +101,9 @@ pub struct Bus {
 
     /// 4 DMA channels (0-3), priority: 0 > 1 > 2 > 3
     pub dma: [DmaChannel; 4],
+
+    /// 4 hardware timers (TM0-TM3)
+    pub timers: [Timer; 4],
 }
 
 impl Bus {
@@ -98,6 +120,7 @@ impl Bus {
             cycles: 0,
             keyinput: 0x03FF,            // All buttons released
             dma: [DmaChannel::new(), DmaChannel::new(), DmaChannel::new(), DmaChannel::new()],
+            timers: [Timer::new(), Timer::new(), Timer::new(), Timer::new()],
         }
     }
 
@@ -134,6 +157,15 @@ impl Bus {
                     // KEYINPUT — return live button state, not the io array
                     0x130 => self.keyinput as u8,
                     0x131 => (self.keyinput >> 8) as u8,
+                    // Timer counter reads — return the live counter, not IO array
+                    0x100 => self.timers[0].counter as u8,
+                    0x101 => (self.timers[0].counter >> 8) as u8,
+                    0x104 => self.timers[1].counter as u8,
+                    0x105 => (self.timers[1].counter >> 8) as u8,
+                    0x108 => self.timers[2].counter as u8,
+                    0x109 => (self.timers[2].counter >> 8) as u8,
+                    0x10C => self.timers[3].counter as u8,
+                    0x10D => (self.timers[3].counter >> 8) as u8,
                     _ => self.io[offset],
                 }
             }
@@ -190,13 +222,44 @@ impl Bus {
             // I/O Registers
             0x0400_0000..=0x0400_03FE => {
                 let offset = (addr & 0x3FF) as usize;
-                self.io[offset] = value;
 
                 // IF register (0x04000202-203): write-1-to-clear (acknowledge interrupts)
                 if offset == 0x202 || offset == 0x203 {
                     self.io[offset] &= !value;
-                    return; // Don't write normally
+                    return;
                 }
+
+                // Timer reload registers — writes set reload, not the live counter
+                match offset {
+                    0x100 => { self.timers[0].reload = (self.timers[0].reload & 0xFF00) | value as u16; return; }
+                    0x101 => { self.timers[0].reload = (self.timers[0].reload & 0x00FF) | ((value as u16) << 8); return; }
+                    0x104 => { self.timers[1].reload = (self.timers[1].reload & 0xFF00) | value as u16; return; }
+                    0x105 => { self.timers[1].reload = (self.timers[1].reload & 0x00FF) | ((value as u16) << 8); return; }
+                    0x108 => { self.timers[2].reload = (self.timers[2].reload & 0xFF00) | value as u16; return; }
+                    0x109 => { self.timers[2].reload = (self.timers[2].reload & 0x00FF) | ((value as u16) << 8); return; }
+                    0x10C => { self.timers[3].reload = (self.timers[3].reload & 0xFF00) | value as u16; return; }
+                    0x10D => { self.timers[3].reload = (self.timers[3].reload & 0x00FF) | ((value as u16) << 8); return; }
+                    _ => {}
+                }
+
+                // Timer control register writes — detect enable edge (0→1)
+                match offset {
+                    0x102 | 0x106 | 0x10A | 0x10E => {
+                        let timer_idx = (offset - 0x102) / 4;
+                        let old_enable = self.io[offset] & 0x80 != 0;
+                        let new_enable = value & 0x80 != 0;
+                        self.io[offset] = value;
+                        // On 0→1 enable transition: reload counter and reset prescaler
+                        if !old_enable && new_enable {
+                            self.timers[timer_idx].counter = self.timers[timer_idx].reload;
+                            self.timers[timer_idx].prescaler_counter = 0;
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+
+                self.io[offset] = value;
 
                 // Check for DMA control register writes.
                 match offset {
@@ -448,6 +511,82 @@ impl Bus {
         if is_vcmatch && !was_vcmatch && (dispstat & 0x20 != 0) {
             // VCount match IRQ (IF bit 2)
             self.io[0x202] |= 0x04;
+        }
+
+        // --- Timers ---
+        self.tick_timers(cycles);
+    }
+
+    /// Advance all enabled timers by the given number of CPU cycles.
+    ///
+    /// Each timer has a prescaler that divides the system clock:
+    ///   0 = 1:1 (every cycle), 1 = 1:64, 2 = 1:256, 3 = 1:1024
+    ///
+    /// Cascade timers (bit 2 of control) don't count cycles — they only
+    /// increment when the previous timer overflows.
+    fn tick_timers(&mut self, cycles: u32) {
+        let prescaler_divs: [u32; 4] = [1, 64, 256, 1024];
+
+        for i in 0..4 {
+            let control = self.io[0x102 + i * 4];
+            let enabled = control & 0x80 != 0;
+            let cascade = control & 0x04 != 0;
+
+            if !enabled || (cascade && i > 0) {
+                continue; // Not running, or cascade (handled by previous timer's overflow)
+            }
+
+            let prescaler = prescaler_divs[(control & 0x3) as usize];
+            self.timers[i].prescaler_counter += cycles;
+
+            // How many timer ticks have elapsed?
+            let ticks = self.timers[i].prescaler_counter / prescaler;
+            self.timers[i].prescaler_counter %= prescaler;
+
+            if ticks > 0 {
+                self.timer_add(i, ticks);
+            }
+        }
+    }
+
+    /// Add `ticks` to timer `idx`, handling overflow, reload, IRQ, and cascade.
+    fn timer_add(&mut self, idx: usize, ticks: u32) {
+        let old = self.timers[idx].counter as u32;
+        let new_val = old + ticks;
+
+        if new_val > 0xFFFF {
+            // Overflow — how many times?
+            let remaining = new_val - 0x10000;
+            let reload = self.timers[idx].reload as u32;
+            // For very large tick counts, there could be multiple overflows
+            let range = 0x10000 - reload as u32;
+            let overflows = if range > 0 { 1 + remaining / range } else { 1 };
+
+            // Reload the counter (accounting for leftover ticks past the last overflow)
+            self.timers[idx].counter = if range > 0 {
+                (reload + remaining % range) as u16
+            } else {
+                reload as u16
+            };
+
+            // Fire IRQ if enabled (control bit 6)
+            let control = self.io[0x102 + idx * 4];
+            if control & 0x40 != 0 {
+                // Timer IRQ: IF bits 3-6 for timers 0-3
+                self.io[0x202] |= 1 << (3 + idx);
+            }
+
+            // Cascade: if the next timer exists and is in cascade mode, feed it
+            if idx < 3 {
+                let next_control = self.io[0x102 + (idx + 1) * 4];
+                let next_enabled = next_control & 0x80 != 0;
+                let next_cascade = next_control & 0x04 != 0;
+                if next_enabled && next_cascade {
+                    self.timer_add(idx + 1, overflows);
+                }
+            }
+        } else {
+            self.timers[idx].counter = new_val as u16;
         }
     }
 
