@@ -7,8 +7,10 @@ use cpu::{Cpu, R_PC, R_SP, R_LR};
 use ppu::{SCREEN_WIDTH, SCREEN_HEIGHT};
 use std::env;
 use std::fs;
+use std::sync::{Arc, Mutex};
 
 use minifb::{Key, Window, WindowOptions};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 /// Cycles per frame on the GBA: 228 scanlines × 1232 cycles each = 280,896.
 const CYCLES_PER_FRAME: u32 = 280_896;
@@ -98,11 +100,108 @@ fn main() {
     }
 }
 
+/// Start the audio output thread. Returns the stream (must be kept alive).
+///
+/// Uses adaptive resampling: the audio thread adjusts its consumption rate
+/// based on how full the shared buffer is. This prevents both underruns
+/// (crackling from running dry) and overruns (latency from buffer growth).
+fn start_audio(audio_buffer: Arc<Mutex<Vec<f32>>>,
+               audio_sample_rate: std::sync::Arc<std::sync::atomic::AtomicU32>) -> Option<cpal::Stream> {
+    let host = cpal::default_host();
+    let device = match host.default_output_device() {
+        Some(d) => d,
+        None => { println!("[Audio] No output device found"); return None; }
+    };
+
+    let config = match device.default_output_config() {
+        Ok(c) => c,
+        Err(e) => { println!("[Audio] No output config: {}", e); return None; }
+    };
+
+    let sample_rate = config.sample_rate().0 as f32;
+    let channels = config.channels() as usize;
+    let buf = audio_buffer;
+    let shared_rate = audio_sample_rate;
+    let mut sample_pos: f32 = 0.0;
+    let mut last_left: f32 = 0.0;
+    let mut last_right: f32 = 0.0;
+
+    // Target buffer level: ~512 stereo pairs (1024 floats).
+    // At ~13 kHz, that's ~38 ms of audio — enough to absorb timing jitter
+    // without adding noticeable latency.
+    let target_buf_floats: f32 = 1024.0;
+
+    let stream = device.build_output_stream(
+        &config.into(),
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            let gba_rate = shared_rate.load(std::sync::atomic::Ordering::Relaxed) as f32;
+            let base_ratio = gba_rate / sample_rate;
+
+            for frame in data.chunks_mut(channels) {
+                if let Ok(mut ring) = buf.lock() {
+                    let buf_len = ring.len() as f32;
+
+                    // Adaptive rate: speed up/slow down consumption to keep
+                    // the buffer near the target level. This absorbs the small
+                    // mismatch between the emulator's actual frame rate and
+                    // the theoretical GBA clock.
+                    let adjust = if buf_len < 4.0 {
+                        // Buffer nearly empty — output silence to avoid pops
+                        0.0
+                    } else {
+                        // Gently steer toward target: ±5% max adjustment
+                        let ratio = buf_len / target_buf_floats;
+                        let factor = 1.0 + (ratio - 1.0).clamp(-0.05, 0.05);
+                        base_ratio * factor
+                    };
+
+                    sample_pos += adjust;
+
+                    let consume = sample_pos as usize;
+                    if consume > 0 && ring.len() >= 2 {
+                        let drain_pairs = consume.min(ring.len() / 2);
+                        if drain_pairs > 0 {
+                            let drain_floats = drain_pairs * 2;
+                            last_left = ring[drain_floats - 2];
+                            last_right = ring[drain_floats - 1];
+                            ring.drain(..drain_floats);
+                        }
+                        sample_pos -= consume as f32;
+                    }
+                }
+
+                if channels >= 2 {
+                    frame[0] = last_left;
+                    frame[1] = last_right;
+                } else {
+                    frame[0] = (last_left + last_right) * 0.5;
+                }
+            }
+        },
+        |err| eprintln!("[Audio] Stream error: {}", err),
+        None,
+    );
+
+    match stream {
+        Ok(s) => {
+            s.play().ok();
+            println!("[Audio] Output started: {}Hz, {} channels", sample_rate, channels);
+            Some(s)
+        }
+        Err(e) => {
+            println!("[Audio] Failed to build stream: {}", e);
+            None
+        }
+    }
+}
+
 /// Run with a graphical window — the normal emulator mode.
 ///
 /// Each iteration: execute one frame's worth of CPU cycles, then render
 /// the screen from VRAM/palette state and display it in the window.
 fn run_with_window(cpu: &mut Cpu, bus: &mut Bus) {
+    // Start audio output thread
+    let _audio_stream = start_audio(Arc::clone(&bus.audio_buffer), Arc::clone(&bus.audio_sample_rate));
     let mut window = Window::new(
         "Turtle GBA",
         SCREEN_WIDTH,
@@ -151,6 +250,7 @@ fn run_with_window(cpu: &mut Cpu, bus: &mut Bus) {
         if elapsed.as_secs_f64() >= 1.0 {
             let fps = fps_frame_count as f64 / elapsed.as_secs_f64();
             window.set_title(&format!("Turtle GBA — {:.0} FPS", fps));
+
             fps_frame_count = 0;
             fps_timer = std::time::Instant::now();
         }

@@ -104,6 +104,20 @@ pub struct Bus {
 
     /// 4 hardware timers (TM0-TM3)
     pub timers: [Timer; 4],
+
+    /// Direct Sound FIFO A — 32-byte queue of 8-bit signed samples
+    pub fifo_a: Vec<i8>,
+    /// Direct Sound FIFO B — 32-byte queue of 8-bit signed samples
+    pub fifo_b: Vec<i8>,
+
+    /// Audio output buffer — ring buffer shared with the audio thread.
+    /// The emulator pushes samples here; the audio callback reads them.
+    pub audio_buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+
+    /// Shared audio sample rate — updated when the sound timer reload changes.
+    /// The audio thread reads this to adjust its resampling ratio.
+    pub audio_sample_rate: std::sync::Arc<std::sync::atomic::AtomicU32>,
+
 }
 
 impl Bus {
@@ -121,6 +135,10 @@ impl Bus {
             keyinput: 0x03FF,            // All buttons released
             dma: [DmaChannel::new(), DmaChannel::new(), DmaChannel::new(), DmaChannel::new()],
             timers: [Timer::new(), Timer::new(), Timer::new(), Timer::new()],
+            fifo_a: Vec::with_capacity(32),
+            fifo_b: Vec::with_capacity(32),
+            audio_buffer: std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(4096))),
+            audio_sample_rate: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(32768)),
         }
     }
 
@@ -261,6 +279,12 @@ impl Bus {
 
                 self.io[offset] = value;
 
+                // SOUNDCNT_H high byte (0x83): FIFO reset bits
+                if offset == 0x83 {
+                    if value & 0x08 != 0 { self.fifo_a.clear(); } // Bit 11: reset FIFO A
+                    if value & 0x80 != 0 { self.fifo_b.clear(); } // Bit 15: reset FIFO B
+                }
+
                 // Check for DMA control register writes.
                 match offset {
                     0x0BB => self.on_dma_control_write(0),
@@ -307,6 +331,30 @@ impl Bus {
 
     /// Write a 32-bit word (4 bytes), little-endian.
     pub fn write_word(&mut self, addr: u32, value: u32) {
+        // FIFO writes push 4 samples at once — don't go through write_byte
+        match addr {
+            0x0400_00A0 => {
+                // FIFO A: push 4 signed 8-bit samples
+                if self.fifo_a.len() < 32 {
+                    self.fifo_a.push(value as i8);
+                    self.fifo_a.push((value >> 8) as i8);
+                    self.fifo_a.push((value >> 16) as i8);
+                    self.fifo_a.push((value >> 24) as i8);
+                }
+                return;
+            }
+            0x0400_00A4 => {
+                // FIFO B: push 4 signed 8-bit samples
+                if self.fifo_b.len() < 32 {
+                    self.fifo_b.push(value as i8);
+                    self.fifo_b.push((value >> 8) as i8);
+                    self.fifo_b.push((value >> 16) as i8);
+                    self.fifo_b.push((value >> 24) as i8);
+                }
+                return;
+            }
+            _ => {}
+        }
         self.write_byte(addr, value as u8);
         self.write_byte(addr + 1, (value >> 8) as u8);
         self.write_byte(addr + 2, (value >> 16) as u8);
@@ -576,6 +624,10 @@ impl Bus {
                 self.io[0x202] |= 1 << (3 + idx);
             }
 
+            // Sound: pop samples from FIFO on timer overflow
+            // SOUNDCNT_H (0x82-0x83) selects which timer drives each FIFO
+            self.on_timer_overflow_sound(idx, overflows);
+
             // Cascade: if the next timer exists and is in cascade mode, feed it
             if idx < 3 {
                 let next_control = self.io[0x102 + (idx + 1) * 4];
@@ -587,6 +639,135 @@ impl Bus {
             }
         } else {
             self.timers[idx].counter = new_val as u16;
+        }
+    }
+
+    /// On timer overflow, check if this timer drives a sound FIFO.
+    /// Pop samples from both FIFOs (if driven by this timer), mix them
+    /// into stereo pairs (L, R), and push to the audio output buffer.
+    /// Also trigger sound DMA to refill FIFOs when they run low.
+    fn on_timer_overflow_sound(&mut self, timer_idx: usize, overflows: u32) {
+        let soundcnt_h = (self.io[0x82] as u16) | ((self.io[0x83] as u16) << 8);
+        let master_enable = self.io[0x84] & 0x80 != 0;
+        if !master_enable { return; }
+
+        // SOUNDCNT_H bit layout for Direct Sound:
+        //   Bit 2:  FIFO A volume (0=50%, 1=100%)
+        //   Bit 3:  FIFO B volume (0=50%, 1=100%)
+        //   Bit 8:  FIFO A → right channel
+        //   Bit 9:  FIFO A → left channel
+        //   Bit 10: FIFO A timer select (0=Timer0, 1=Timer1)
+        //   Bit 12: FIFO B → right channel
+        //   Bit 13: FIFO B → left channel
+        //   Bit 14: FIFO B timer select (0=Timer0, 1=Timer1)
+        let fifo_a_timer = if soundcnt_h & (1 << 10) != 0 { 1 } else { 0 };
+        let fifo_b_timer = if soundcnt_h & (1 << 14) != 0 { 1 } else { 0 };
+        let fifo_a_active = timer_idx == fifo_a_timer
+            && soundcnt_h & ((1 << 8) | (1 << 9)) != 0;
+        let fifo_b_active = timer_idx == fifo_b_timer
+            && soundcnt_h & ((1 << 12) | (1 << 13)) != 0;
+
+        if !fifo_a_active && !fifo_b_active { return; }
+
+        // Update the shared sample rate from the timer's reload value.
+        // GBA clock = 16,780,000 Hz. Sample rate = clock / (0x10000 - reload).
+        let reload = self.timers[timer_idx].reload as u32;
+        let period = 0x10000u32.saturating_sub(reload).max(1);
+        let control = self.io[0x102 + timer_idx * 4];
+        let prescaler = [1u32, 64, 256, 1024][(control & 3) as usize];
+        let rate = 16_780_000 / (period * prescaler);
+        self.audio_sample_rate.store(rate, std::sync::atomic::Ordering::Relaxed);
+
+        let a_vol_full = soundcnt_h & (1 << 2) != 0;
+        let b_vol_full = soundcnt_h & (1 << 3) != 0;
+        let a_right = soundcnt_h & (1 << 8) != 0;
+        let a_left  = soundcnt_h & (1 << 9) != 0;
+        let b_right = soundcnt_h & (1 << 12) != 0;
+        let b_left  = soundcnt_h & (1 << 13) != 0;
+
+
+        for _ in 0..overflows {
+            let mut left: f32 = 0.0;
+            let mut right: f32 = 0.0;
+
+            if fifo_a_active {
+                let raw = if !self.fifo_a.is_empty() {
+                    self.fifo_a.remove(0)
+                } else { 0 };
+                let mut s = raw as f32 / 128.0;
+                if !a_vol_full { s *= 0.5; }
+                if a_left  { left  += s; }
+                if a_right { right += s; }
+            }
+
+            if fifo_b_active {
+                let raw = if !self.fifo_b.is_empty() {
+                    self.fifo_b.remove(0)
+                } else { 0 };
+                let mut s = raw as f32 / 128.0;
+                if !b_vol_full { s *= 0.5; }
+                if b_left  { left  += s; }
+                if b_right { right += s; }
+            }
+
+            if let Ok(mut buf) = self.audio_buffer.lock() {
+                if buf.len() < 16384 {
+                    // Push as interleaved stereo: [left, right, left, right, ...]
+                    buf.push(left);
+                    buf.push(right);
+                }
+            }
+        }
+
+        // Refill FIFOs when running low
+        if fifo_a_active && self.fifo_a.len() <= 16 {
+            self.check_sound_dma_a();
+        }
+        if fifo_b_active && self.fifo_b.len() <= 16 {
+            self.check_sound_dma_b();
+        }
+    }
+
+    /// Trigger sound DMA for FIFO A (DMA1 or DMA2 with start_timing=3, dest=FIFO_A).
+    fn check_sound_dma_a(&mut self) {
+        for ch in 1..=2 {
+            if self.dma[ch].enabled() && self.dma[ch].start_timing() == 3 {
+                let dest = self.dma[ch].dad;
+                if dest == 0x0400_00A0 {
+                    let src = self.dma[ch].internal_sad;
+                    for w in 0..4u32 {
+                        let val = self.read_word(src.wrapping_add(w * 4));
+                        self.fifo_a.push(val as i8);
+                        self.fifo_a.push((val >> 8) as i8);
+                        self.fifo_a.push((val >> 16) as i8);
+                        self.fifo_a.push((val >> 24) as i8);
+                    }
+                    self.dma[ch].internal_sad = src.wrapping_add(16);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Trigger sound DMA for FIFO B (DMA1 or DMA2 with start_timing=3).
+    fn check_sound_dma_b(&mut self) {
+        for ch in 1..=2 {
+            if self.dma[ch].enabled() && self.dma[ch].start_timing() == 3 {
+                // Check if this DMA targets FIFO B (dest = 0x040000A4)
+                let dest = self.dma[ch].dad;
+                if dest == 0x0400_00A4 {
+                    let src = self.dma[ch].internal_sad;
+                    for w in 0..4u32 {
+                        let val = self.read_word(src.wrapping_add(w * 4));
+                        self.fifo_b.push(val as i8);
+                        self.fifo_b.push((val >> 8) as i8);
+                        self.fifo_b.push((val >> 16) as i8);
+                        self.fifo_b.push((val >> 24) as i8);
+                    }
+                    self.dma[ch].internal_sad = src.wrapping_add(16);
+                    return;
+                }
+            }
         }
     }
 
